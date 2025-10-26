@@ -138,7 +138,9 @@ def _global_link_speakers(
 ) -> Tuple[dict, dict]:
     """
     Satukan speaker ID lokal jadi global konsisten (SPK_01, SPK_02, ...),
-    TAPI sekarang kita cegah laki/perempuan ketimpa jadi satu cluster.
+    TAPI kita cegah laki/perempuan ketimpa jadi satu cluster (gender guard),
+    lalu pastikan SEMUA speaker (termasuk yg durasinya pendek banget)
+    akhirnya punya ID SPK_xx. Jadi di editor tidak ada lagi SPEAKER_00.
     """
 
     # --- load json awal ---
@@ -158,6 +160,7 @@ def _global_link_speakers(
             tbl = spk_obj["speakers"]
         else:
             tbl = spk_obj
+
         if isinstance(tbl, list):
             out = {}
             for it in tbl:
@@ -183,9 +186,10 @@ def _global_link_speakers(
     )
     local_spks = list(samples.keys())
     if not local_spks:
+        # tidak ada sample cukup panjang -> balikkan apa adanya
         return seg, spk
 
-    # Hitung centroid embedding per speaker lokal
+    # Hitung centroid embedding per speaker lokal (pakai ECAPA)
     centroids = {}
     dur_by = {}
     for sp_local in local_spks:
@@ -197,21 +201,19 @@ def _global_link_speakers(
         centroids[sp_local] = c
         dur_by[sp_local] = sum(b - a for a, b in samples[sp_local])
 
-    # cluster global
-    global_ids = []      # ["SPK_01", ...]
-    global_vecs = []     # centroid gabungan untuk cluster tsb
+    # struktur cluster global
+    global_ids = []      # ["SPK_01", "SPK_02", ...]
+    global_vecs = []     # centroid gabungan untuk tiap cluster
     global_wgts = []     # total durasi gabungan
     cluster_gender = []  # gender cluster saat ini ("male"/"female"/"unknown")
     mapping = {}         # speaker lokal -> SPK_xx
 
-    # urutkan speaker lokal dari durasi terpanjang dulu jadi anchor
+    # urutkan speaker lokal dari durasi terpanjang, biar anchor kuat dulu
     for sp_local in sorted(local_spks, key=lambda x: dur_by.get(x, 0), reverse=True):
         v = centroids.get(sp_local)
 
-        # gender lokal dari hasil dracin_gender
-        g_local = (
-            (spk_tbl.get(sp_local, {}).get("gender") or "unknown").lower()
-        )
+        # gender lokal hasil klasifikasi hf_svm / reference
+        g_local = (spk_tbl.get(sp_local, {}).get("gender") or "unknown").lower()
         if g_local not in ("male", "female", "unknown"):
             g_local = "unknown"
 
@@ -225,43 +227,46 @@ def _global_link_speakers(
             mapping[sp_local] = gid
             continue
 
-        # cari cluster terbaik yg mirip
+        # cari cluster global yg paling mirip (pakai cosine sim)
         best_i, best_sim = None, -1.0
         for i, gvec in enumerate(global_vecs):
             if gvec is None:
                 continue
 
-            # --- GENDER GUARD: kalau dua2nya tahu gender dan beda, skip compare
+            # --- GENDER GUARD ---
+            # jika cluster & kandidat sama-sama punya gender pasti (male/female)
+            # dan gender berbeda -> jangan merge
             g_cluster = cluster_gender[i]
             if (
                 g_local in ("male", "female")
                 and g_cluster in ("male", "female")
                 and g_local != g_cluster
             ):
-                continue  # jangan merge cowok ke cluster cewek atau sebaliknya
+                continue  # cegah cowok & cewek ketempel jadi satu SPK
 
             s = _cos(v, gvec)
             if s > best_sim:
                 best_sim = s
                 best_i = i
 
-        # cek threshold similarity
+        # cukup mirip -> merge ke cluster yg sudah ada
         if best_i is not None and best_sim >= link_threshold:
-            # merge ke cluster existing
             gvec = global_vecs[best_i]
             w_old = float(global_wgts[best_i])
             w_new = float(dur_by.get(sp_local, 0.0))
+
             new = (gvec * (w_old + 1e-8) + v * (w_new + 1e-8))
             new = new / (np.linalg.norm(new) + 1e-8)
 
             global_vecs[best_i] = new
             global_wgts[best_i] = w_old + w_new
 
-            # jangan overwrite gender cluster kalau cluster_gender[best_i] sudah punya male/female
-            if cluster_gender[best_i] in ("unknown", None, "") and g_local in ("male","female"):
+            # jangan overwrite gender yang sudah "male"/"female"
+            if cluster_gender[best_i] in ("unknown", None, "") and g_local in ("male", "female"):
                 cluster_gender[best_i] = g_local
 
             mapping[sp_local] = global_ids[best_i]
+
         else:
             # bikin cluster baru
             gid = f"SPK_{len(global_ids)+1:02d}"
@@ -271,14 +276,56 @@ def _global_link_speakers(
             cluster_gender.append(g_local)
             mapping[sp_local] = gid
 
-    # --- (opsional) enforce max_speakers sama seperti kode lama ---
-    #   (disini bisa dibiarkan sama seperti implementasi kamu sekarang,
-    #    termasuk nearest_pair merge, tapi kalau merge di sini
-    #    sebaiknya juga hormati gender guard. Bisa kamu copy logic lama
-    #    + tambahin check gender sama seperti di atas.)
+    # --- (opsional) enforce max_speakers bisa ditambahkan di sini
+    # kalau kamu punya logic lama "gabung sampai max_speakers",
+    # pastikan juga hormati gender guard sama seperti di atas.
+    # (kalau tidak ada / tidak dipakai, biarkan kosong)
 
-    # Apply mapping ke semua segment
+    # ===================================================================
+    #  NEW STEP:
+    #  Pastikan SEMUA label speaker mentah (misal "SPEAKER_00") ikut
+    #  mendapat mapping -> SPK_xx juga, walau dia terlalu pendek
+    #  untuk dihitung centroid di atas.
+    #  Tujuannya supaya UI Editing TIDAK lagi menampilkan campuran
+    #  SPEAKER_00 dan SPK_01, tapi full SPK_01 / SPK_02 / SPK_03 ...
+    # ===================================================================
+
     seg_key = _safe_speaker_key(segments[0]) or "speaker"
+
+    # kumpulkan semua label yg ada di segments
+    all_labels = set()
+    for s in segments:
+        raw = s.get(seg_key)
+        if isinstance(raw, list):
+            for r in raw:
+                all_labels.add(r)
+        elif isinstance(raw, str):
+            all_labels.add(raw)
+
+    # untuk setiap label yg belum punya mapping, buat SPK baru
+    for sp_local in sorted(all_labels):
+        if sp_local in mapping:
+            continue
+
+        # ambil gender lokal kalau ada (kalau gak ada -> unknown)
+        g_local = (spk_tbl.get(sp_local, {}).get("gender") or "unknown").lower()
+        if g_local not in ("male", "female", "unknown"):
+            g_local = "unknown"
+
+        gid = f"SPK_{len(global_ids)+1:02d}"
+        global_ids.append(gid)
+        global_vecs.append(None)
+        global_wgts.append(0.0)
+        cluster_gender.append(g_local)
+
+        mapping[sp_local] = gid
+
+    # ===================================================================
+    #  END NEW STEP
+    # ===================================================================
+
+    # Terapkan mapping ke semua segmen:
+    # sekarang SEMUA speaker ID harus jadi "SPK_xx"
     for s in segments:
         sp_val = s.get(seg_key)
         if isinstance(sp_val, list):
@@ -286,7 +333,12 @@ def _global_link_speakers(
         elif isinstance(sp_val, str):
             s[seg_key] = mapping.get(sp_val, sp_val)
 
-    # Build tabel speakers final (mirip kode lama)
+    # Bangun tabel speakers final:
+    # speakers: {
+    #   "SPK_01": { "gender": "Male", ... },
+    #   "SPK_02": { "gender": "Female", ... },
+    #   ...
+    # }
     by_global = {}
     for loc, gid in mapping.items():
         by_global.setdefault(gid, []).append(loc)
@@ -294,19 +346,23 @@ def _global_link_speakers(
     merged = {}
     for gid, locals_ in by_global.items():
         info = {}
+
+        # coba ambil info paling informatif dari salah satu anggota lokal
         for k in ("gender", "voice", "notes", "age", "accent"):
             for x in locals_:
                 val = spk_tbl.get(x, {}).get(k)
                 if val not in (None, "", "unknown"):
                     info[k] = val
                     break
-        # fallback gender kalau belum ada
+
+        # fallback gender kalau belum ketemu apa-apa
         if "gender" not in info or info["gender"] in (None, "", "unknown"):
             info["gender"] = cluster_gender[global_ids.index(gid)] or "unknown"
 
         merged[gid] = info
 
     return {"segments": segments}, {"speakers": merged}
+
 
 
 
