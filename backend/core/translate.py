@@ -62,7 +62,7 @@ def build_system_prompt(style: str, target_lang: str) -> str:
             "6. JANGAN tambahkan kata penghubung yang tidak perlu\n"
             "7. Untuk nama: pertahankan aslinya\n"
             "8. Ubah 'Hmph' menjadi 'Hmm'\n"
-            "9. Kalimat tanya → pakai '?'; kalimat seru → pakai '!'.\n"
+            "9. Jika kalimat Tanya maka tambahkan tanda tanya (?) dan jika kalimat seru maka tambahkan tanda seru (!).\n"
             "10. Pronomina: aku/kamu; dia; mereka; kita/kami sesuai konteks.\n"
             "JIKA TERLALU PANDAI = SALAH. TEKANAN PADA SINGKAT & ALAMI."
         )
@@ -78,7 +78,7 @@ def build_system_prompt(style: str, target_lang: str) -> str:
             "6. JANGAN tambahkan kata penghubung yang tidak perlu\n"
             "7. Untuk nama: pertahankan aslinya\n"
             "8. Ubah 'Hmph' menjadi 'Hmm'\n"
-            "9. Kalimat tanya → pakai '?'; kalimat seru → pakai '!'.\n"
+            "9. Jika kalimat Tanya maka tambahkan tanda tanya (?) dan jika kalimat seru maka tambahkan tanda seru (!).\n"
             "10. Pronomina: aku/kamu; dia; mereka; kita/kami sesuai konteks.\n"
             "JIKA TERLALU PANDAI = SALAH. TEKANAN PADA SINGKAT & ALAMI."
         )

@@ -236,8 +236,8 @@ async def run_diarization(
 
     # mode baru hf_svm: parameter voting
     # (UI lama tidak mengirim field ini, tapi kita kasih default supaya tidak error)
-    min_vote: float = Form(0.6),
-    min_len_sec: float = Form(1.0),
+    min_vote: float = Form(0.7),
+    min_len_sec: float = Form(0.5),
 
     # berapa segmen terpanjang per speaker yg dipakai buat gender
     top_n: int = Form(5),
@@ -335,6 +335,19 @@ async def get_session(
         return JSONResponse(pm._serialize_session(session))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/session/{session_id}/delete")
+async def delete_session(session_id: str, pm = Depends(get_processing_manager)):
+    """
+    Hapus session dari memori + hapus folder workspace fisiknya.
+    Dipakai tombol Delete di tab SRT Processing.
+    """
+    try:
+        pm.delete_session(session_id)
+        return JSONResponse({"status": "deleted", "session_id": session_id})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 def iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
     with open(path, "rb") as f:

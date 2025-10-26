@@ -311,7 +311,7 @@ class DracinApp {
 					<!-- HF SVM settings (MODE: hf_svm) -->
 					<div id="hf-minvote-wrap">
 						<label class="block text-sm font-medium mb-2 text-gray-300">min_vote</label>
-						<input id="min-vote" type="number" min="0.5" max="1.0" step="0.05" value="0.6"
+						<input id="min-vote" type="number" min="0.5" max="1.0" step="0.05" value="0.7"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
 						<p class="text-xs text-gray-400 mt-1">
 							Mayoritas suara yg sama harus ≥ nilai ini (kalau tidak → Unknown)
@@ -320,7 +320,7 @@ class DracinApp {
 
 					<div id="hf-minlen-wrap">
 						<label class="block text-sm font-medium mb-2 text-gray-300">min_len_sec</label>
-						<input id="min-len-sec" type="number" min="0.2" step="0.1" value="1.0"
+						<input id="min-len-sec" type="number" min="0.2" step="0.1" value="0.5"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
 						<p class="text-xs text-gray-400 mt-1">
 							Abaikan potongan suara yang terlalu pendek (teriak sepersekian detik)
@@ -416,20 +416,37 @@ class DracinApp {
 				</button>
 			</div>
 
-			<!-- Session Info -->
-			<div class="mt-6 bg-gray-700 rounded-lg p-4">
+			<!-- Load / Delete Existing Session -->
+			<div class="mt-4 bg-gray-700 rounded-lg p-4">
 				<h3 class="text-lg font-semibold mb-3 text-white">
-					<i class="fas fa-info-circle mr-2"></i>Current Session
+					<i class="fas fa-folder-open mr-2"></i>Manage Sessions
 				</h3>
-				<div id="current-session-info" class="text-gray-300">
-					<div class="flex items-center justify-between">
-						<span>No active session</span>
-						<button id="create-test-session" class="bg-gray-600 hover:bg-gray-500 px-3 py-1 rounded text-sm transition-colors">
-							Create Test Session
+
+				<div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+					<!-- dropdown pilih session -->
+					<div class="md:col-span-2">
+						<label class="block text-sm font-medium mb-2 text-gray-300">Existing Sessions</label>
+						<select id="proc-session-select"
+							class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
+							<option value="">— pilih session —</option>
+						</select>
+					</div>
+
+					<!-- tombol load -->
+					<div class="flex gap-2">
+						<button id="proc-load-session"
+							class="bg-yellow-500 hover:bg-yellow-600 px-4 py-2 rounded text-sm transition-colors">
+							<i class="fas fa-download mr-1"></i>Load
+						</button>
+
+						<button id="proc-delete-session"
+							class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm transition-colors">
+							<i class="fas fa-trash mr-1"></i>Delete
 						</button>
 					</div>
 				</div>
 			</div>
+
 
 			<!-- Log Output -->
 			<div class="mt-6">
@@ -442,6 +459,20 @@ class DracinApp {
 			</div>
 		</div>
 	`;
+
+	// setelah render HTML tab SRT Processing:
+	this._procPopulateSessionSelector();
+
+	// tombol load session lama
+	document
+	  .getElementById('proc-load-session')
+	  ?.addEventListener('click', () => this._procLoadSelectedSession());
+
+	// tombol delete session
+	document
+	  .getElementById('proc-delete-session')
+	  ?.addEventListener('click', () => this._procDeleteSelectedSession());
+
 
 	// tampil/sembunyikan blok input sesuai gender mode
 	function toggleGenderModeUI() {
@@ -550,6 +581,83 @@ class DracinApp {
         
         document.body.appendChild(fileInput);
     }
+
+	// isi dropdown di tab SRT Processing
+	async _procPopulateSessionSelector() {
+	  try {
+		const res = await fetch('/api/sessions');
+		if (!res.ok) {
+		  this.showNotification('Gagal ambil daftar session', 'error');
+		  return;
+		}
+
+		const list = await res.json(); // backend balikin array session [{id,...}] :contentReference[oaicite:3]{index=3}
+		const sel = document.getElementById('proc-session-select');
+		if (!sel) return;
+
+		sel.innerHTML =
+		  `<option value="">— pilih session —</option>` +
+		  list.map(s => `<option value="${s.id}">${s.id}</option>`).join('');
+	  } catch (err) {
+		console.error(err);
+	  }
+	}
+
+	// klik tombol "Load" di tab SRT Processing
+	async _procLoadSelectedSession() {
+	  const sel = document.getElementById('proc-session-select');
+	  const chosen = sel ? sel.value.trim() : '';
+	  if (!chosen) {
+		this.showNotification('Pilih session dulu', 'warning');
+		return;
+	  }
+
+	  // set session aktif global app
+	  this.currentSessionId = chosen;
+
+	  // update tampilan "Current Session" card
+	  this.updateSessionInfo(chosen);
+
+	  this.showNotification(`Session ${chosen} loaded`, 'success');
+	}
+
+	// klik tombol "Delete" (opsional, aktif kalau backend delete sudah ada)
+	async _procDeleteSelectedSession() {
+	  const sel = document.getElementById('proc-session-select');
+	  const chosen = sel ? sel.value.trim() : '';
+	  if (!chosen) {
+		this.showNotification('Pilih session yang mau dihapus', 'warning');
+		return;
+	  }
+
+	  // konfirmasi kecil di UI
+	  if (!confirm(`Hapus session ${chosen}? (folder kerja akan hilang)`)) {
+		return;
+	  }
+
+	  // panggil backend delete (lihat poin 3 di bawah)
+	  const res = await fetch(`/api/session/${chosen}/delete`, {
+		method: 'POST'
+	  });
+
+	  const txt = await res.text();
+	  if (!res.ok) {
+		this.showNotification(`Gagal hapus: ${txt}`, 'error');
+		return;
+	  }
+
+	  this.showNotification(`Session ${chosen} dihapus`, 'success');
+
+	  // kalau session yang lagi aktif kebetulan sama -> kosongkan
+	  if (this.currentSessionId === chosen) {
+		this.currentSessionId = null;
+		this.updateSessionInfo('(no active session)');
+	  }
+
+	  // refresh isi dropdown supaya langsung hilang tanpa Ctrl+F5
+	  this._procPopulateSessionSelector();
+	}
+
 
     setupDragAndDrop(dropZone, type) {
         // Drag over effect
@@ -737,8 +845,8 @@ class DracinApp {
 	  const male_ref      = (maleRefEl?.value || '').trim();
 	  const female_ref    = (femaleRefEl?.value || '').trim();
 
-	  const min_vote      = (minVoteEl?.value || '0.6').trim();
-	  const min_len_sec   = (minLenEl?.value || '1.0').trim();
+	  const min_vote      = (minVoteEl?.value || '0.7').trim();
+	  const min_len_sec   = (minLenEl?.value || '0.5').trim();
 
 	  const top_n         = topNEl?.value ? parseInt(topNEl.value, 10) : 6;
 	  const hf_token      = (hfTokenEl?.value || '').trim();

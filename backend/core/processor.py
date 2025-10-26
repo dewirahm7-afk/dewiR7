@@ -741,6 +741,27 @@ class ProcessingManager:
     def list_sessions(self):
         return self.session_manager.list_sessions()
 
+    def delete_session(self, session_id: str):
+        """
+        Hapus session dari SessionManager + hapus folder workdir di disk.
+        """
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            raise RuntimeError(f"Unknown session_id {session_id}")
+
+        # simpan path sebelum di-pop
+        workdir = getattr(session, "workdir", None)
+
+        # buang dari SessionManager
+        self.session_manager.delete_session(session_id)
+
+        # hapus folder fisik (jika ada)
+        if workdir:
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception as e:
+                print(f"[WARN] gagal hapus workspace {workdir}: {e}")
+                
     async def run_translate(self, session_id: Optional[str], cfg: Dict[str, Any]):
         """
         Panggil TranslateEngine (DeepSeek style) langsung dari core/translate.py
