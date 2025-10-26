@@ -218,187 +218,249 @@ class DracinApp {
         const tabContent = document.getElementById('srt-processing');
         if (!tabContent) return;
 
-        tabContent.innerHTML = `
-            <div class="bg-gray-800 rounded-lg p-6">
-                <h2 class="text-2xl font-bold mb-6 text-blue-400">
-                    <i class="fas fa-file-alt mr-2"></i>SRT Processing
-                </h2>
+	tabContent.innerHTML = `
+		<div class="bg-gray-800 rounded-lg p-6">
+			<h2 class="text-2xl font-bold mb-6 text-blue-400">
+				<i class="fas fa-file-alt mr-2"></i>SRT Processing
+			</h2>
 
-                <!-- File Upload Section -->
-                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-                    <!-- Video Upload -->
-                    <div class="bg-gray-700 rounded-lg p-4">
-                        <h3 class="text-lg font-semibold mb-3 text-white">
-                            <i class="fas fa-video mr-2"></i>Video File
-                        </h3>
-                        <div class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center hover:border-blue-400 transition-colors cursor-pointer" id="video-drop-zone">
-                            <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 mb-3"></i>
-                            <p class="text-gray-300 mb-2">Drag & drop video file or click to browse</p>
-                            <p class="text-sm text-gray-400 mb-4">Supported: MP4, MKV, AVI, MOV</p>
-                            <button class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded transition-colors">
-                                <i class="fas fa-search mr-2"></i>Browse Files
-                            </button>
-                            <div id="video-file-info" class="mt-3 text-sm text-green-400 hidden">
-                                <i class="fas fa-check-circle mr-1"></i>
-                                <span>Video file selected</span>
-                            </div>
-                        </div>
-                    </div>
+			<!-- File Upload Section -->
+			<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+				<!-- Video Upload -->
+				<div class="bg-gray-700 rounded-lg p-4">
+					<h3 class="text-lg font-semibold mb-3 text-white">
+						<i class="fas fa-video mr-2"></i>Video File
+					</h3>
+					<div class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center hover:border-blue-400 transition-colors cursor-pointer" id="video-drop-zone">
+						<i class="fas fa-cloud-upload-alt text-4xl text-gray-400 mb-3"></i>
+						<p class="text-gray-300 mb-2">Drag & drop video file or click to browse</p>
+						<p class="text-sm text-gray-400 mb-4">Supported: MP4, MKV, AVI, MOV</p>
+						<button class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded transition-colors">
+							<i class="fas fa-search mr-2"></i>Browse Files
+						</button>
+						<div id="video-file-info" class="mt-3 text-sm text-green-400 hidden">
+							<i class="fas fa-check-circle mr-1"></i>
+							<span>Video file selected</span>
+						</div>
+					</div>
+				</div>
 
-                    <!-- SRT Upload -->
-                    <div class="bg-gray-700 rounded-lg p-4">
-                        <h3 class="text-lg font-semibold mb-3 text-white">
-                            <i class="fas fa-file-text mr-2"></i>SRT File
-                        </h3>
-                        <div class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center hover:border-blue-400 transition-colors cursor-pointer" id="srt-drop-zone">
-                            <i class="fas fa-file-upload text-4xl text-gray-400 mb-3"></i>
-                            <p class="text-gray-300 mb-2">Drag & drop SRT Hasil OCR</p>
-                            <p class="text-sm text-gray-400 mb-4">Format: SubRip (.srt)</p>
-                            <button class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded transition-colors">
-                                <i class="fas fa-search mr-2"></i>Browse Files
-                            </button>
-                            <div id="srt-file-info" class="mt-3 text-sm text-green-400 hidden">
-                                <i class="fas fa-check-circle mr-1"></i>
-                                <span>SRT file selected</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+				<!-- SRT Upload -->
+				<div class="bg-gray-700 rounded-lg p-4">
+					<h3 class="text-lg font-semibold mb-3 text-white">
+						<i class="fas fa-file-text mr-2"></i>SRT File
+					</h3>
+					<div class="border-2 border-dashed border-gray-600 rounded-lg p-6 text-center hover:border-blue-400 transition-colors cursor-pointer" id="srt-drop-zone">
+						<i class="fas fa-file-upload text-4xl text-gray-400 mb-3"></i>
+						<p class="text-gray-300 mb-2">Drag & drop SRT Hasil OCR</p>
+						<p class="text-sm text-gray-400 mb-4">Format: SubRip (.srt)</p>
+						<button class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded transition-colors">
+							<i class="fas fa-search mr-2"></i>Browse Files
+						</button>
+						<div id="srt-file-info" class="mt-3 text-sm text-green-400 hidden">
+							<i class="fas fa-check-circle mr-1"></i>
+							<span>SRT file selected</span>
+						</div>
+					</div>
+				</div>
+			</div>
 
-                <!-- Diarization Configuration -->
-                <div class="bg-gray-700 rounded-lg p-4 mb-6">
-                    <h3 class="text-lg font-semibold mb-4 text-white">
-                        <i class="fas fa-users mr-2"></i>Diarization Configuration
-                    </h3>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-sm font-medium mb-2 text-gray-300">Male Reference</label>
-                            <input id="male-ref" type="text" value="D:\\dubdracin\\samples\\male" 
-                                   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium mb-2 text-gray-300">Female Reference</label>
-                            <input id="female-ref" type="text" value="D:\\dubdracin\\samples\\female" 
-                                   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium mb-2 text-gray-300">HF Token</label>
-                            <input id="hf-token" type="password" value="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"
-                                   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium mb-2 text-gray-300">Top N Segments</label>
-                            <input id="top-n" type="number" value="6" 
-                                   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
-                        </div>
-							<!-- —— Global Linking Settings —— -->
-							<div class="col-span-1 md:col-span-2 border-t border-gray-600 pt-3 mt-2"></div>
+			<!-- Diarization Configuration -->
+			<div class="bg-gray-700 rounded-lg p-4 mb-6">
+				<h3 class="text-lg font-semibold mb-4 text-white">
+					<i class="fas fa-users mr-2"></i>Diarization Configuration
+				</h3>
 
-							<div class="flex items-center">
-							  <input id="link-global" type="checkbox" class="mr-2" checked>
-							  <label for="link-global" class="text-gray-300">Enable Global Speaker Linking</label>
-							</div>
+				<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
 
-							<div>
-							  <label class="block text-sm font-medium mb-2 text-gray-300">link_threshold</label>
-							  <input id="link-threshold" type="number" min="0" max="1" step="0.01" value="0.93"
-									 class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
-							</div>
+					<!-- Gender Mode -->
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">Gender Mode</label>
+						<select id="gender-mode"
+								class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
+							<option value="hf_svm" selected>Pretrained (HF SVM)</option>
+							<option value="reference">Reference Banks (Manual)</option>
+						</select>
+						<p class="text-xs text-gray-400 mt-1">
+							hf_svm = otomatis pakai model pretrained<br>
+							reference = pakai folder Male/Female kamu
+						</p>
+					</div>
 
-							<div>
-							  <label class="block text-sm font-medium mb-2 text-gray-300">samples_per_spk</label>
-							  <input id="samples-per-spk" type="number" min="1" step="1" value="8"
-									 class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
-							</div>
+					<!-- Top N Segments -->
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">Top N Segments</label>
+						<input id="top-n" type="number" value="6"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
+						<p class="text-xs text-gray-400 mt-1">Ambil segmen terpanjang speaker untuk analisis gender</p>
+					</div>
 
-							<div>
-							  <label class="block text-sm font-medium mb-2 text-gray-300">min_speakers (opsional)</label>
-							  <input id="min-speakers" type="number" min="1" step="1"
-									 class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
-							</div>
+					<!-- Male/Female ref (MODE: reference) -->
+					<div id="ref-male-wrap">
+						<label class="block text-sm font-medium mb-2 text-gray-300">Male Reference</label>
+						<input id="male-ref" type="text" value="D:\\dubdracin\\samples\\male"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
+					</div>
 
-							<div>
-							  <label class="block text-sm font-medium mb-2 text-gray-300">max_speakers (opsional)</label>
-							  <input id="max-speakers" type="number" min="1" step="1"
-									 class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
-							</div>
+					<div id="ref-female-wrap">
+						<label class="block text-sm font-medium mb-2 text-gray-300">Female Reference</label>
+						<input id="female-ref" type="text" value="D:\\dubdracin\\samples\\female"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
+					</div>
 
-							<div>
-							  <label class="block text-sm font-medium mb-2 text-gray-300">min_sample_dur (detik)</label>
-							  <input id="min-sample-dur" type="number" min="0.2" step="0.1" value="1.5"
-									 class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
-							</div>
+					<!-- HF SVM settings (MODE: hf_svm) -->
+					<div id="hf-minvote-wrap">
+						<label class="block text-sm font-medium mb-2 text-gray-300">min_vote</label>
+						<input id="min-vote" type="number" min="0.5" max="1.0" step="0.05" value="0.6"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
+						<p class="text-xs text-gray-400 mt-1">
+							Mayoritas suara yg sama harus ≥ nilai ini (kalau tidak → Unknown)
+						</p>
+					</div>
 
-                        <div class="flex items-center mt-2">
-                            <input id="use-gpu" type="checkbox" id="use-gpu" checked class="mr-2 w-4 h-4 text-blue-500 bg-gray-600 border-gray-500 rounded focus:ring-blue-400">
-                            <label for="use-gpu" class="text-gray-300">Use GPU for Diarization</label>
-                        </div>
-                    </div>
-                </div>
+					<div id="hf-minlen-wrap">
+						<label class="block text-sm font-medium mb-2 text-gray-300">min_len_sec</label>
+						<input id="min-len-sec" type="number" min="0.2" step="0.1" value="1.0"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
+						<p class="text-xs text-gray-400 mt-1">
+							Abaikan potongan suara yang terlalu pendek (teriak sepersekian detik)
+						</p>
+					</div>
 
-                <!-- Progress Section -->
-                <div class="bg-gray-700 rounded-lg p-4 mb-6">
-                    <h3 class="text-lg font-semibold mb-3 text-white">
-                        <i class="fas fa-tasks mr-2"></i>Processing Progress
-                    </h3>
-                    <div class="space-y-4">
-                        <div>
-                            <div class="flex justify-between mb-2">
-                                <span class="text-sm text-gray-300" id="current-step">Ready to process</span>
-                                <span class="text-sm text-gray-300" id="progress-percent">0%</span>
-                            </div>
-                            <div class="w-full bg-gray-600 rounded-full h-3">
-                                <div id="progress-bar" class="bg-blue-500 h-3 rounded-full transition-all duration-500 ease-out" style="width: 0%"></div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+					<!-- HF Token -->
+					<div class="md:col-span-2">
+						<label class="block text-sm font-medium mb-2 text-gray-300">HF Token</label>
+						<input id="hf-token" type="password" value="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"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
+					</div>
 
-                <!-- Action Buttons -->
-                <div class="flex flex-wrap gap-3">
-                    <button id="create-session" class="bg-green-500 hover:bg-green-600 px-4 py-2 rounded flex items-center transition-colors">
-                        <i class="fas fa-plus mr-2"></i>Create Session
-                    </button>
-                    <button id="generate-workdir" class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded flex items-center transition-colors">
-                        <i class="fas fa-folder-plus mr-2"></i>Generate Workdir
-                    </button>
-                    <button id="extract-audio" class="bg-purple-500 hover:bg-purple-600 px-4 py-2 rounded flex items-center transition-colors">
-                        <i class="fas fa-volume-up mr-2"></i>Extract Audio
-                    </button>
-                    <button id="run-diarization" class="bg-orange-500 hover:bg-orange-600 px-4 py-2 rounded flex items-center transition-colors">
-                        <i class="fas fa-users mr-2"></i>Run Diarization
-                    </button>
-                    <button id="load-to-translate" class="bg-indigo-500 hover:bg-indigo-600 px-4 py-2 rounded flex items-center transition-colors">
-                        <i class="fas fa-arrow-right mr-2"></i>Load to Translate
-                    </button>
-                </div>
+					<!-- —— Global Linking Settings —— -->
+					<div class="col-span-1 md:col-span-2 border-t border-gray-600 pt-3 mt-2"></div>
 
-                <!-- Session Info -->
-                <div class="mt-6 bg-gray-700 rounded-lg p-4">
-                    <h3 class="text-lg font-semibold mb-3 text-white">
-                        <i class="fas fa-info-circle mr-2"></i>Current Session
-                    </h3>
-                    <div id="current-session-info" class="text-gray-300">
-                        <div class="flex items-center justify-between">
-                            <span>No active session</span>
-                            <button id="create-test-session" class="bg-gray-600 hover:bg-gray-500 px-3 py-1 rounded text-sm transition-colors">
-                                Create Test Session
-                            </button>
-                        </div>
-                    </div>
-                </div>
+					<div class="flex items-center">
+						<input id="link-global" type="checkbox" class="mr-2" checked>
+						<label for="link-global" class="text-gray-300">Enable Global Speaker Linking</label>
+					</div>
 
-                <!-- Log Output -->
-                <div class="mt-6">
-                    <h3 class="text-lg font-semibold mb-3 text-white">
-                        <i class="fas fa-terminal mr-2"></i>Processing Log
-                    </h3>
-                    <div id="log-output" class="bg-gray-900 rounded p-4 h-48 overflow-y-auto font-mono text-sm">
-                        <div class="text-gray-500">Log output will appear here...</div>
-                    </div>
-                </div>
-            </div>
-        `;
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">link_threshold</label>
+						<input id="link-threshold" type="number" min="0" max="1" step="0.01" value="0.93"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">samples_per_spk</label>
+						<input id="samples-per-spk" type="number" min="1" step="1" value="8"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">min_speakers (opsional)</label>
+						<input id="min-speakers" type="number" min="1" step="1"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">max_speakers (opsional)</label>
+						<input id="max-speakers" type="number" min="1" step="1"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium mb-2 text-gray-300">min_sample_dur (detik)</label>
+						<input id="min-sample-dur" type="number" min="0.2" step="0.1" value="1.5"
+							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 text-white">
+					</div>
+
+					<div class="flex items-center mt-2 md:col-span-2">
+						<input id="use-gpu" type="checkbox" checked class="mr-2 w-4 h-4 text-blue-500 bg-gray-600 border-gray-500 rounded focus:ring-blue-400">
+						<label for="use-gpu" class="text-gray-300">Use GPU for Diarization</label>
+					</div>
+				</div>
+			</div>
+
+			<!-- Progress Section -->
+			<div class="bg-gray-700 rounded-lg p-4 mb-6">
+				<h3 class="text-lg font-semibold mb-3 text-white">
+					<i class="fas fa-tasks mr-2"></i>Processing Progress
+				</h3>
+				<div class="space-y-4">
+					<div>
+						<div class="flex justify-between mb-2">
+							<span class="text-sm text-gray-300" id="current-step">Ready to process</span>
+							<span class="text-sm text-gray-300" id="progress-percent">0%</span>
+						</div>
+						<div class="w-full bg-gray-600 rounded-full h-3">
+							<div id="progress-bar" class="bg-blue-500 h-3 rounded-full transition-all duration-500 ease-out" style="width: 0%"></div>
+						</div>
+					</div>
+				</div>
+			</div>
+
+			<!-- Action Buttons -->
+			<div class="flex flex-wrap gap-3">
+				<button id="create-session" class="bg-green-500 hover:bg-green-600 px-4 py-2 rounded flex items-center transition-colors">
+					<i class="fas fa-plus mr-2"></i>Create Session
+				</button>
+				<button id="generate-workdir" class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded flex items-center transition-colors">
+					<i class="fas fa-folder-plus mr-2"></i>Generate Workdir
+				</button>
+				<button id="extract-audio" class="bg-purple-500 hover:bg-purple-600 px-4 py-2 rounded flex items-center transition-colors">
+					<i class="fas fa-volume-up mr-2"></i>Extract Audio
+				</button>
+				<button id="run-diarization" class="bg-orange-500 hover:bg-orange-600 px-4 py-2 rounded flex items-center transition-colors">
+					<i class="fas fa-users mr-2"></i>Run Diarization
+				</button>
+				<button id="load-to-translate" class="bg-indigo-500 hover:bg-indigo-600 px-4 py-2 rounded flex items-center transition-colors">
+					<i class="fas fa-arrow-right mr-2"></i>Load to Translate
+				</button>
+			</div>
+
+			<!-- Session Info -->
+			<div class="mt-6 bg-gray-700 rounded-lg p-4">
+				<h3 class="text-lg font-semibold mb-3 text-white">
+					<i class="fas fa-info-circle mr-2"></i>Current Session
+				</h3>
+				<div id="current-session-info" class="text-gray-300">
+					<div class="flex items-center justify-between">
+						<span>No active session</span>
+						<button id="create-test-session" class="bg-gray-600 hover:bg-gray-500 px-3 py-1 rounded text-sm transition-colors">
+							Create Test Session
+						</button>
+					</div>
+				</div>
+			</div>
+
+			<!-- Log Output -->
+			<div class="mt-6">
+				<h3 class="text-lg font-semibold mb-3 text-white">
+					<i class="fas fa-terminal mr-2"></i>Processing Log
+				</h3>
+				<div id="log-output" class="bg-gray-900 rounded p-4 h-48 overflow-y-auto font-mono text-sm">
+					<div class="text-gray-500">Log output will appear here...</div>
+				</div>
+			</div>
+		</div>
+	`;
+
+	// tampil/sembunyikan blok input sesuai gender mode
+	function toggleGenderModeUI() {
+		const mode = document.getElementById('gender-mode')?.value || 'hf_svm';
+		const showRef = (mode === 'reference');
+
+		// mode reference butuh male/female ref, sembunyikan setting hf_svm
+		document.getElementById('ref-male-wrap').style.display   = showRef ? '' : 'none';
+		document.getElementById('ref-female-wrap').style.display = showRef ? '' : 'none';
+
+		// mode hf_svm butuh min_vote/min_len_sec
+		document.getElementById('hf-minvote-wrap').style.display = showRef ? 'none' : '';
+		document.getElementById('hf-minlen-wrap').style.display  = showRef ? 'none' : '';
+	}
+
+	// pas pertama render SRT tab:
+	toggleGenderModeUI();
+	document.getElementById('gender-mode')?.addEventListener('change', toggleGenderModeUI);
+
 
         // Add event listeners for this tab
         this.setupSRTProcessingEvents();
@@ -645,92 +707,127 @@ class DracinApp {
 	}
 
 
-    // Tab 1 – Diarization
-    async runDiarization() {
-      // pastikan sudah ada session
-      if (!this.currentSessionId) {
-        this.showNotification('Create Session dulu.', 'error');
-        return;
-      }
+	// Tab 1 – Diarization
+	async runDiarization() {
+	  if (!this.currentSessionId) {
+		this.showNotification('Create Session dulu.', 'error');
+		return;
+	  }
 
-      // ambil input dari UI
-      const maleRefEl    = document.getElementById('male-ref');
-      const femaleRefEl  = document.getElementById('female-ref');
-      const hfTokenEl    = document.getElementById('hf-token');
-      const useGpuEl     = document.getElementById('use-gpu');
-      const topNEl       = document.getElementById('top-n');
+	  // --- ambil semua elemen UI ---
+	  const modeEl        = document.getElementById('gender-mode');
+	  const maleRefEl     = document.getElementById('male-ref');
+	  const femaleRefEl   = document.getElementById('female-ref');
+	  const minVoteEl     = document.getElementById('min-vote');
+	  const minLenEl      = document.getElementById('min-len-sec');
 
-      const male_ref     = (maleRefEl?.value || '').trim();
-      const female_ref   = (femaleRefEl?.value || '').trim();
-      const hf_token     = (hfTokenEl?.value || '').trim();
-      const use_gpu      = useGpuEl?.checked ? 'true' : 'false';
-      const top_n        = topNEl?.value ? parseInt(topNEl.value, 10) : 5;
+	  const topNEl        = document.getElementById('top-n');
+	  const hfTokenEl     = document.getElementById('hf-token');
+	  const useGpuEl      = document.getElementById('use-gpu');
 
-      if (!male_ref || !female_ref) {
-        this.showNotification('Male/Female Reference wajib diisi.', 'error');
-        return;
-      }
+	  const linkGlobalEl    = document.getElementById('link-global');
+	  const linkThresholdEl = document.getElementById('link-threshold');
+	  const spsEl           = document.getElementById('samples-per-spk');
+	  const minSpeakersEl   = document.getElementById('min-speakers');
+	  const maxSpeakersEl   = document.getElementById('max-speakers');
+	  const minSampleDurEl  = document.getElementById('min-sample-dur');
 
-      const url = `/api/session/${this.currentSessionId}/diarization`;
-      const body = new URLSearchParams({
-        male_ref,
-        female_ref,
-        hf_token,
-        use_gpu,
-        top_n: String(top_n),
-      });
-	  
-		const link_global     = document.getElementById('link-global')?.checked ? 'true' : 'false';
-		const link_threshold  = document.getElementById('link-threshold')?.value || '0.93';
-		const samples_per_spk = document.getElementById('samples-per-spk')?.value || '8';
-		const min_speakers    = document.getElementById('min-speakers')?.value || '';
-		const max_speakers    = document.getElementById('max-speakers')?.value || '';
-		const min_sample_dur  = document.getElementById('min-sample-dur')?.value || '1.5';
+	  // --- ambil nilai ---
+	  const gender_mode   = (modeEl?.value || 'hf_svm').trim(); // "hf_svm" / "reference"
+	  const male_ref      = (maleRefEl?.value || '').trim();
+	  const female_ref    = (femaleRefEl?.value || '').trim();
 
-		body.append('link_global', link_global);
-		body.append('link_threshold', String(link_threshold));
-		body.append('samples_per_spk', String(samples_per_spk));
-		if (min_speakers) body.append('min_speakers', String(parseInt(min_speakers,10)));
-		if (max_speakers) body.append('max_speakers', String(parseInt(max_speakers,10)));
-		body.append('min_sample_dur', String(min_sample_dur));
+	  const min_vote      = (minVoteEl?.value || '0.6').trim();
+	  const min_len_sec   = (minLenEl?.value || '1.0').trim();
 
-      try {
-        this.appendLog?.('Running diarization...');
-        this.showLoading('Running diarization...');
+	  const top_n         = topNEl?.value ? parseInt(topNEl.value, 10) : 6;
+	  const hf_token      = (hfTokenEl?.value || '').trim();
+	  const use_gpu       = useGpuEl?.checked ? 'true' : 'false';
 
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body,
-        });
+	  const link_global     = linkGlobalEl?.checked ? 'true' : 'false';
+	  const link_threshold  = linkThresholdEl?.value || '0.93';
+	  const samples_per_spk = spsEl?.value || '8';
+	  const min_speakers    = minSpeakersEl?.value || '';
+	  const max_speakers    = maxSpeakersEl?.value || '';
+	  const min_sample_dur  = minSampleDurEl?.value || '1.5';
 
-        const text = await res.text(); // ambil body apa adanya dulu
+	  // --- validasi ringan ---
+	  if (gender_mode === 'reference') {
+		if (!male_ref || !female_ref) {
+		  this.showNotification('Male/Female Reference wajib diisi untuk mode Reference.', 'error');
+		  return;
+		}
+	  }
 
-        if (!res.ok) {
-          // tampilkan pesan error asli dari backend biar gampang debug
-          this.showNotification(`Failed to run diarization: ${text}`, 'error');
-          this.appendLog?.(text);
-          return;
-        }
+	  if (!hf_token) {
+		this.showNotification('HF Token wajib diisi.', 'error');
+		return;
+	  }
 
-        // coba parse JSON respon
-        let data = {};
-        try { data = JSON.parse(text); } catch (_) {}
+	  // --- siapkan body request sesuai backend baru kita ---
+	  const body = new URLSearchParams();
+	  body.append('gender_mode', gender_mode);
+	  body.append('hf_token', hf_token);
+	  body.append('use_gpu', use_gpu);
+	  body.append('top_n', String(top_n));
 
-        const segPath = data.segments_path || data.segjson || '';
-        const spkPath = data.speakers_path || data.spkjson || '';
+	  if (gender_mode === 'reference') {
+		body.append('male_ref', male_ref);
+		body.append('female_ref', female_ref);
+		// (mode lama tidak butuh min_vote/min_len_sec)
+	  } else {
+		// hf_svm mode
+		body.append('min_vote', String(min_vote));
+		body.append('min_len_sec', String(min_len_sec));
+		// (hf_svm tidak butuh male_ref/female_ref)
+	  }
 
-        if (segPath) this.appendLog?.(`Segments: ${segPath}`);
-        if (spkPath) this.appendLog?.(`Speakers: ${spkPath}`);
+	  // global linking
+	  body.append('link_global', link_global);
+	  body.append('link_threshold', String(link_threshold));
+	  body.append('samples_per_spk', String(samples_per_spk));
+	  if (min_speakers) body.append('min_speakers', String(parseInt(min_speakers, 10)));
+	  if (max_speakers) body.append('max_speakers', String(parseInt(max_speakers, 10)));
+	  body.append('min_sample_dur', String(min_sample_dur));
 
-        this.updateProgress?.(100, 'Diarization done');
-        this.showNotification('Diarization completed successfully', 'success');
-      } catch (err) {
-        this.showNotification(`Failed to run diarization: ${err?.message || err}`, 'error');
-      } finally {
-        this.hideLoading();
-      }
-    }
+	  const url = `/api/session/${this.currentSessionId}/diarization`;
+
+	  try {
+		this.appendLog?.('Running diarization...');
+		this.showLoading('Running diarization...');
+
+		const res = await fetch(url, {
+		  method: 'POST',
+		  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		  body,
+		});
+
+		const text = await res.text();
+
+		if (!res.ok) {
+		  this.showNotification(`Failed to run diarization: ${text}`, 'error');
+		  this.appendLog?.(text);
+		  return;
+		}
+
+		let data = {};
+		try { data = JSON.parse(text); } catch (_) {}
+
+		const segPath = data.segments_path || data.segjson || '';
+		const spkPath = data.speakers_path || data.spkjson || '';
+
+		if (segPath) this.appendLog?.(`Segments: ${segPath}`);
+		if (spkPath) this.appendLog?.(`Speakers: ${spkPath}`);
+
+		this.updateProgress?.(100, 'Diarization done');
+		this.showNotification('Diarization completed successfully', 'success');
+	  } catch (err) {
+		this.showNotification(`Failed to run diarization: ${err?.message || err}`, 'error');
+	  } finally {
+		this.hideLoading();
+	  }
+	}
+
 
     updateProgress(percent, message) {
       const bar   = document.getElementById('progress-bar');

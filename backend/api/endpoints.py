@@ -219,13 +219,38 @@ async def extract_audio(
 @router.post("/api/session/{session_id}/diarization")
 async def run_diarization(
     session_id: str,
-    male_ref: str = Form(...),
-    female_ref: str = Form(...),
-    hf_token: str = Form(...),
-    use_gpu: bool = Form(True),
+
+    # =========================
+    # GENDER CONFIG
+    # =========================
+    # dropdown baru di frontend:
+    #   "reference"  -> mode lama (butuh male_ref/female_ref)
+    #   "hf_svm"     -> mode baru (pakai model griko)
+    #
+    # default "reference" = aman buat UI lama
+    gender_mode: str = Form("reference"),
+
+    # mode lama: wajib, mode baru: boleh kosong
+    male_ref: Optional[str] = Form(None),
+    female_ref: Optional[str] = Form(None),
+
+    # mode baru hf_svm: parameter voting
+    # (UI lama tidak mengirim field ini, tapi kita kasih default supaya tidak error)
+    min_vote: float = Form(0.6),
+    min_len_sec: float = Form(1.0),
+
+    # berapa segmen terpanjang per speaker yg dipakai buat gender
     top_n: int = Form(5),
 
-    # --- NEW: knob Global Linking (Layer A)
+    # =========================
+    # DIARIZATION / DEVICE
+    # =========================
+    hf_token: str = Form(...),
+    use_gpu: bool = Form(True),
+
+    # =========================
+    # GLOBAL SPEAKER LINKING
+    # =========================
     link_global: str = Form("true"),        # "true"/"false"
     link_threshold: float = Form(0.93),
     samples_per_spk: int = Form(8),
@@ -235,25 +260,52 @@ async def run_diarization(
 
     pm = Depends(get_processing_manager),
 ):
-    try:
-        result = await pm.run_diarization(
-            session_id,
-            {
-                "male_ref": male_ref,
-                "female_ref": female_ref,
-                "hf_token": hf_token,
-                "use_gpu": use_gpu,
-                "top_n": top_n,
+    """
+    Endpoint ini sekarang support 2 mode gender:
+    - reference : pakai bank male_ref/female_ref (versi lama)
+    - hf_svm    : pakai model pretrained HF (griko/gender_cls_svm_ecapa_voxceleb)
+                  -> tidak butuh male_ref/female_ref
+                  -> pakai voting min_vote/min_len_sec
+    """
 
-                # --- NEW: diteruskan ke processor
-                "link_global": (link_global or "true").lower() == "true",
-                "link_threshold": float(link_threshold),
-                "samples_per_spk": int(samples_per_spk),
-                "min_speakers": min_speakers,
-                "max_speakers": max_speakers,
-                "min_sample_dur": float(min_sample_dur),
-            },
-        )
+    try:
+        # siapkan config lengkap buat ProcessingManager
+        cfg = {
+            # --- mode klasifikasi gender:
+            "gender_mode": gender_mode,           # "reference" atau "hf_svm"
+
+            # untuk mode "reference" (lama)
+            "male_ref": male_ref or "",
+            "female_ref": female_ref or "",
+
+            # untuk mode "hf_svm" (baru)
+            "min_vote": float(min_vote),
+            "min_len_sec": float(min_len_sec),
+
+            # umum untuk kedua mode
+            "top_n": int(top_n),
+
+            # diarization requirement
+            "hf_token": hf_token,
+            "use_gpu": bool(use_gpu),
+
+            # global linking config
+            "link_global": (link_global or "true").lower() == "true",
+            "link_threshold": float(link_threshold),
+            "samples_per_spk": int(samples_per_spk),
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+            "min_sample_dur": float(min_sample_dur),
+        }
+
+        # jalankan pipeline diarization + gender + (opsional) global linking
+        result = await pm.run_diarization(session_id, cfg)
+
+        # ProcessingManager diharapkan balikin dict minimal:
+        # {
+        #   "segments_path": <path ke *_segments.json final>,
+        #   "speakers_path": <path ke *_speakers.json final>
+        # }
 
         return JSONResponse(
             {
@@ -262,13 +314,13 @@ async def run_diarization(
                 "speakers_path": str(result["speakers_path"]),
             }
         )
+
     except Exception as e:
         import traceback
-
         raise HTTPException(
-            status_code=400, detail=f"{e}\n{traceback.format_exc()}"
+            status_code=400,
+            detail=f"{e}\n{traceback.format_exc()}",
         )
-
 
 # Info & utilities used across tabs
 @router.get("/api/session/{session_id}")

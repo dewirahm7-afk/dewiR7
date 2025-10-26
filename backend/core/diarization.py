@@ -55,7 +55,12 @@ class DiarizationEngine:
                     return out
 
                 def make_bank(ref_input: str, label: str) -> str:
-                    """Bangun <label>_bank.wav (16k mono) di workdir dari folder/file."""
+                    """
+                    Bangun <label>_bank.wav (16k mono) di workdir dari folder/file.
+                    - kalau ref_input adalah folder, gabung semua file audio jadi satu bank.
+                    - kalau ref_input adalah 1 file, jadikan dia bank tunggal.
+                    Return: path string ke bank .wav final di workdir.
+                    """
                     src = Path(os.path.expandvars(ref_input)).expanduser()
                     files = list_audio(src)
                     if not files:
@@ -65,22 +70,32 @@ class DiarizationEngine:
                     meta_samples = []
                     for f in files:
                         wav, sr = torchaudio.load(str(f))
+                        # channel merge -> mono
                         if wav.dim() == 2 and wav.size(0) > 1:
-                            wav = wav.mean(dim=0, keepdim=True)  # mono
+                            wav = wav.mean(dim=0, keepdim=True)
+                        wav = wav.squeeze(0)
+                        # resample -> 16k
                         if sr != 16000:
-                            wav = torchaudio.functional.resample(wav, sr, 16000)
+                            wav = torchaudio.transforms.Resample(sr, 16000)(wav)
                         chunks.append(wav)
-                        meta_samples.append(int(wav.shape[-1]))
+                        meta_samples.append(
+                            {
+                                "src": str(f),
+                                "dur_sec": float(wav.numel()) / 16000.0,
+                            }
+                        )
 
-                    bank = torch.cat(chunks, dim=-1)  # concat time
+                    full = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
                     out_wav = workdir / f"{label}_bank.wav"
-                    torchaudio.save(str(out_wav), bank, 16000)
+                    torchaudio.save(
+                        str(out_wav),
+                        full.unsqueeze(0),
+                        16000,
+                        encoding="PCM_S",
+                        bits_per_sample=16,
+                    )
 
-                    cache = {
-                        "sources": [str(f) for f in files],
-                        "sr": 16000,
-                        "samples_per_chunk": meta_samples,
-                    }
+                    cache = {"files": meta_samples}
                     (workdir / f"{label}_bank_cache.json").write_text(
                         json.dumps(cache, indent=2), encoding="utf-8"
                     )
@@ -95,57 +110,85 @@ class DiarizationEngine:
                     return items[0] if items else None
 
                 def bring_to_root(p: Path) -> Path:
+                    """
+                    pastikan semua *_segments.json, *_speakers.json, *.srt
+                    akhirnya pindah ke root workdir (bukan subfolder)
+                    """
                     if p and p.parent != workdir:
                         dst = workdir / p.name
                         try:
                             shutil.move(str(p), str(dst))
                         except Exception:
-                            dst = p  # fallback
+                            # kalau gagal move (misal sama drive?), ya sudah biarkan di tempat
+                            dst = p
                         return dst
                     return p
 
-                # ── siapkan referensi (folder -> bank; file -> tetap diproses sebagai bank 1 file) ──
-                male_ref_in = config["male_ref"]
-                female_ref_in = config["female_ref"]
-                male_ref_wav = make_bank(male_ref_in, "male")
-                female_ref_wav = make_bank(female_ref_in, "female")
+                # ───────────────────────────────────────────
+                # Ambil parameter dari config
+                # ───────────────────────────────────────────
+                gender_mode = config.get("gender_mode", "reference")  # "reference" / "hf_svm"
+                top_n       = int(config.get("top_n", 6))
+                hf_token    = (config.get("hf_token") or "").strip()
+                use_gpu     = bool(config.get("use_gpu", True))
 
-                # ── susun argv untuk dracin_gender (pakai underscore, outdir='.') ──
+                # hanya dipakai mode hf_svm:
+                min_vote    = float(config.get("min_vote", 0.6))
+                min_len_sec = float(config.get("min_len_sec", 1.0))
+
+                # hanya dipakai mode reference:
+                male_ref_in   = config.get("male_ref", "")
+                female_ref_in = config.get("female_ref", "")
+
+                # nama file audio vokal 16k (sudah diextract step sebelumnya)
                 audio_arg = Path(session.wav_16k).name
-                male_ref_arg = Path(male_ref_wav).name
-                female_ref_arg = Path(female_ref_wav).name
 
-                top_n = int(config.get("top_n", 6))
-                hf_token = (config.get("hf_token") or "").strip()
-                use_gpu = bool(config.get("use_gpu", True))
-
+                # siapkan argv untuk panggil dracin_gender.main()
                 argv_backup = sys.argv[:]
                 sys.argv = [
                     "dracin_gender",
-                    "--audio",
-                    audio_arg,
-                    "--male_ref",
-                    male_ref_arg,
-                    "--female_ref",
-                    female_ref_arg,
-                    "--outdir",
-                    ".",  # sangat penting: tulis ke CWD (workdir)
-                    "--top_n",
-                    str(top_n),
+                    "--audio", audio_arg,
+                    "--gender_mode", gender_mode,
+                    "--outdir", ".",         # sangat penting: output ke workdir
+                    "--top_n", str(top_n),
                 ]
+
+                if gender_mode == "reference":
+                    # kita butuh bank male/female
+                    male_ref_wav = make_bank(male_ref_in,   "male")
+                    female_ref_wav = make_bank(female_ref_in, "female")
+
+                    male_ref_arg   = Path(male_ref_wav).name
+                    female_ref_arg = Path(female_ref_wav).name
+
+                    sys.argv += [
+                        "--male_ref", male_ref_arg,
+                        "--female_ref", female_ref_arg,
+                    ]
+                    # tidak kirim --min_vote / --min_len_sec di mode lama
+
+                else:
+                    # gender_mode == "hf_svm"
+                    # tidak ada bank referensi
+                    sys.argv += [
+                        "--min_vote", str(min_vote),
+                        "--min_len_sec", str(min_len_sec),
+                    ]
+
+                # optional flags umum
                 if hf_token:
                     sys.argv += ["--hf_token", hf_token]
                 if use_gpu:
                     sys.argv += ["--use_gpu"]
 
-                # ── jalankan di CWD = workdir ───────────────────────────────────
+                # ── jalankan dracin_gender.py di CWD = workdir ──────────────────
                 old_cwd = os.getcwd()
                 os.chdir(workdir)
                 try:
                     try:
-                        gender_main()  # TANPA argumen; argparse baca sys.argv
+                        gender_main()  # argparse di dracin_gender akan baca sys.argv yg barusan kita isi
                     except SystemExit as e:
-                        # argparse exit (kode 2 jika argumen tidak valid)
+                        # argparse bisa SystemExit(code=2) kalau argumen salah
                         return {
                             "success": False,
                             "error": f"dracin_gender exited with code {getattr(e, 'code', None)}",
@@ -154,7 +197,7 @@ class DiarizationEngine:
                     os.chdir(old_cwd)
                     sys.argv = argv_backup
 
-                # ── ambil output terbaru (JSON + SRT) dan pastikan di root workdir ──
+                # ── cari output terbaru lalu bawa ke root workdir ───────────────
                 seg = latest("*_gender_*_segments.json")
                 spk = latest("*_gender_*_speakers.json")
                 srt = latest("*_gender_*.srt")  # opsional
@@ -162,25 +205,36 @@ class DiarizationEngine:
                 if not seg or not spk:
                     return {
                         "success": False,
-                        "error": "Diarization selesai tapi file output tidak ditemukan.",
+                        "error": "gender_main selesai tapi tidak menghasilkan seg/spk json",
                     }
 
                 seg = bring_to_root(seg)
                 spk = bring_to_root(spk)
                 srt = bring_to_root(srt) if srt else None
 
-                data = {"segjson": str(seg), "spkjson": str(spk)}
+                data = {
+                    "segjson": str(seg),
+                    "spkjson": str(spk),
+                }
                 if srt:
                     data["srt"] = str(srt)
+
                 return {"success": True, "data": data}
 
             except BaseException as e:
-                return {"success": False, "error": f"{e}\n{traceback.format_exc()}"}
+                return {
+                    "success": False,
+                    "error": f"{e}\n{traceback.format_exc()}",
+                }
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(self.executor, task)
 
         # guard: jangan pernah return None
         if not isinstance(result, dict):
-            return {"success": False, "error": f"Engine returned invalid result: {result!r}"}
+            return {
+                "success": False,
+                "error": f"Engine returned invalid result: {result!r}",
+            }
         return result
+
