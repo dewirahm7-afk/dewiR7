@@ -2701,6 +2701,10 @@ tab.innerHTML = `
 		</label>
 
       <div class="ml-auto flex items-center gap-2">
+		<button id="ed-auto-sync"
+		  class="bg-purple-600 hover:bg-purple-700 px-3 py-2 rounded text-white text-sm flex items-center">
+		  <i class="fas fa-clock mr-1"></i>Auto Sync Timing
+		</button>
         <button id="ed-save" class="btn btn-primary px-3 py-1">Save</button>
         <button id="ed-merge" class="btn bg-green-500 px-3 py-1" disabled>Gabung Subtitle</button>
         <button id="ed-exp-male" class="btn bg-pink-500 px-3 py-1">Export Male</button>
@@ -3057,6 +3061,14 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
   this.editing.warnOnly = document.getElementById('ed-warn-only').checked;
   this._edFilterRender();
 });
+  // Auto Sync Timing (geser subtitle vs voice, server-side)
+  const autoBtn = document.getElementById('ed-auto-sync');
+  if (autoBtn && !autoBtn._bound) {
+    autoBtn._bound = true;
+    autoBtn.addEventListener('click', async () => {
+      await this.edAutoSync();
+    });
+  }
 
   $('ed-exp-full')?.addEventListener('click', () => this._edExport('full'));
   $('ed-merge')?.addEventListener('click', () => this._edMergeSelected());
@@ -3163,6 +3175,23 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
 	}
 
 }
+
+async edAutoSync() {
+  if (!this.currentSessionId) return this.showNotification('No active session', 'error');
+  this.showLoading('Auto-syncing timing to voice…');
+  try {
+    const res = await fetch(`/api/session/${this.currentSessionId}/editing/auto-sync`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail || 'Failed');
+    await this._edLoad(this.currentSessionId); // reload tabel dari server
+    this.showNotification(`Auto-sync OK (anchors=${data.anchors}, a=${data.fit.a.toFixed(4)}, b=${data.fit.b_ms}ms)`, 'success');
+  } catch (e) {
+    this.showNotification(`Auto-sync error: ${e.message||e}`, 'error');
+  } finally {
+    this.hideLoading();
+  }
+}
+
 
 
 _edPopulateSpeakerFilter(list) {
