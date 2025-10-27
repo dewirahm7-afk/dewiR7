@@ -2710,6 +2710,10 @@ tab.innerHTML = `
         <button id="ed-exp-speaker" class="btn bg-orange-500 px-3 py-1">Export Speaker Dipilih</button>
         <button id="ed-exp-speaker-zip" class="btn bg-orange-500 px-3 py-1">Semua Speakers (zip)</button>
         <button id="ed-exp-full" class="btn bg-red-500 px-3 py-1">Export Full SRT</button>
+		  <button id="ed-reset"
+      class="bg-red-500 hover:bg-red-600 px-3 py-2 rounded text-white text-sm flex items-center">
+      <i class="fas fa-sync mr-1"></i>Reset Cache
+  </button>
       </div>
     </div>
 
@@ -3118,6 +3122,46 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
 
   const v = $('ed-video');
   v?.addEventListener('timeupdate', () => this._edOnVideoTime(v.currentTime));
+  
+	const resetBtn = document.getElementById('ed-reset');
+	if (resetBtn) {
+		resetBtn.addEventListener('click', async () => {
+			if (!this.currentSessionId) {
+				this.showNotification('No active session', 'error');
+				return;
+			}
+
+			const ok = confirm(
+				'Reset cache? Semua edit manual di tab Editing akan hilang dan akan diganti hasil diarization/translate terbaru.'
+			);
+			if (!ok) return;
+
+			try {
+				this.showLoading('Resetting editing cache...');
+				// panggil endpoint backend baru
+				const res = await fetch(`/api/session/${this.currentSessionId}/editing/reset`, {
+					method: 'POST'
+				});
+
+				const txt = await res.text();
+				if (!res.ok) {
+					this.showNotification(`Reset gagal: ${txt}`, 'error');
+					return;
+				}
+
+				// setelah cache dihapus, panggil loader bawaan yang biasa dipakai
+				// untuk ngisi tabel editing dari server:
+				await this._edLoad(this.currentSessionId);
+
+				this.showNotification('Editing cache refreshed from latest diarization / translation', 'success');
+			} catch (err) {
+				this.showNotification(`Reset error: ${err?.message || err}`, 'error');
+			} finally {
+				this.hideLoading();
+			}
+		});
+	}
+
 }
 
 

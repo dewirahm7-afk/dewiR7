@@ -215,6 +215,41 @@ async def extract_audio(
         import traceback
         raise HTTPException(status_code=400, detail=f"{e}\n{traceback.format_exc()}")
 
+def make_export_filename(spk_id: str) -> str:
+    """
+    Ubah "SPK_01" -> "01_SPK.srt"
+    Kalau formatnya aneh, fallback ke "<spk_id>.srt"
+    """
+    m = re.match(r"^SPK_(\d+)$", spk_id)
+    if m:
+        num = m.group(1)  # "01"
+        return f"{num}_SPK.srt"
+    else:
+        # fallback aman
+        return f"{spk_id}.srt"
+
+@router.post("/api/session/{session_id}/editing/reset")
+def reset_editing_cache(session_id: str, pm = Depends(get_processing_manager)):
+    """
+    Hapus editing_cache.json supaya frontend bisa rebuild dari diarization+translate terbaru.
+    WARNING: semua edit manual di tab Editing akan hilang.
+    Frontend nanti akan panggil /api/session/{session_id}/editing lagi
+    untuk rebuild cache baru dan reload tabel.
+    """
+    ws = _ws(pm, session_id)  # util yg sama dipakai route editing lain
+    cache_p = ws / "editing_cache.json"
+
+    try:
+        if cache_p.exists():
+            cache_p.unlink()  # delete file cache lama
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal hapus editing_cache.json: {e}"
+        )
+
+    # balikin status sukses aja, frontend yg bakal reload tabel
+    return {"status": "reset_ok", "session_id": session_id}
 
 @router.post("/api/session/{session_id}/diarization")
 async def run_diarization(
@@ -971,19 +1006,19 @@ def _load_diarization_segments(workdir: Path) -> List[dict]:
     Jika ada speakers.json, pakai sebagai fallback gender per speaker.
     """
     seg_json = None
-    for p in sorted(workdir.glob("*_gender_*_segments.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+    for p in sorted(workdir.glob("*_gender_segments.json"), key=lambda x: x.stat().st_mtime, reverse=True):
         seg_json = p; break
     if not seg_json:
-        for p in sorted(workdir.glob("**/*_gender_*_segments.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for p in sorted(workdir.glob("**/*_gender_segments.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             seg_json = p; break
     segments = []
     speaker_gender = {}
 
     sp_json = None
-    for p in sorted(workdir.glob("*_gender_*_speakers.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+    for p in sorted(workdir.glob("*_gender_speakers.json"), key=lambda x: x.stat().st_mtime, reverse=True):
         sp_json = p; break
     if not sp_json:
-        for p in sorted(workdir.glob("**/*_gender_*_speakers.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for p in sorted(workdir.glob("**/*_gender_speakers.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             sp_json = p; break
 
     if sp_json:
@@ -1532,6 +1567,27 @@ def export_editing(session_id: str, req: ExportReq):
         spk = (spk or "").strip()
         return [r for r in rows if (r.get("speaker") or "").strip() == spk]
 
+    # >>> helper baru untuk rename "SPK_01" -> "01_SPK.srt"
+    def make_export_filename_for_speaker(spk_id: str) -> str:
+        """
+        Contoh:
+          SPK_01 -> 01_SPK.srt
+          SPK_12 -> 12_SPK.srt
+        Kalau formatnya bukan 'SPK_xx', fallback ke nama original + .srt
+        """
+        import re
+        raw = (spk_id or "").strip()
+        m = re.match(r"^SPK_(\d+)$", raw)
+        if m:
+            num = m.group(1)  # "01"
+            nice = f"{num}_SPK"
+        else:
+            # fallback: tetap pakai label asli
+            nice = raw if raw else "UNKNOWN_SPK"
+        # amankan buat filesystem
+        safe = _safe_name(nice)
+        return f"{safe}.srt"
+
     # --- gender (1 file) ---
     if req.mode in ("male", "female", "unknown"):
         srt = _build_srt(sel_gender(req.mode), req.reindex)
@@ -1546,18 +1602,23 @@ def export_editing(session_id: str, req: ExportReq):
         group = sel_speaker(req.speaker)
         if not group:
             raise HTTPException(404, f"No rows for speaker: {req.speaker}")
+
         srt = _build_srt(group, req.reindex)
-        safe = _safe_name(req.speaker)
-        out = d / f"{safe}.srt"
+
+        # >>> ganti penamaan file di sini
+        fname = make_export_filename_for_speaker(req.speaker)
+        out = d / fname
+
         out.write_text(srt, encoding="utf-8")
         return FileResponse(out, media_type="text/plain", filename=out.name)
 
+    # --- full (1 file full dialog semua) ---
     elif req.mode == "full":
         srt = _build_srt(rows, req.reindex)
         out = d / f"{session_id}_full.srt"
         out.write_text(srt, encoding="utf-8")
         return FileResponse(out, media_type="text/plain", filename=out.name)
-    
+
     # --- speaker_zip (banyak file, zip) ---
     elif req.mode == "speaker_zip":
         speakers = sorted({
@@ -1575,7 +1636,14 @@ def export_editing(session_id: str, req: ExportReq):
                 if not group:
                     continue
                 srt = _build_srt(group, req.reindex)
-                arc = f"{_safe_name(spk)}.srt"
+
+                # >>> sebelumnya:
+                # arc = f"{_safe_name(spk)}.srt"
+                # sekarang pakai filename baru
+                arc = make_export_filename_for_speaker(spk)
+
+                # NOTE: ZipFile.writestr() pakai nama di dalam ZIP,
+                # bukan path fisik di disk
                 zf.writestr(arc, srt)
 
         return FileResponse(

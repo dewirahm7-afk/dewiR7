@@ -198,9 +198,9 @@ class DiarizationEngine:
                     sys.argv = argv_backup
 
                 # ── cari output terbaru lalu bawa ke root workdir ───────────────
-                seg = latest("*_gender_*_segments.json")
-                spk = latest("*_gender_*_speakers.json")
-                srt = latest("*_gender_*.srt")  # opsional
+                seg = latest("*_gender_segments.json")
+                spk = latest("*_gender_speakers.json")
+                srt = latest("*_gender.srt")  # opsional
 
                 if not seg or not spk:
                     return {

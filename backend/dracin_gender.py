@@ -321,7 +321,7 @@ def main():
     rand4 = random.randint(1000, 9999)
     stem = Path(args.audio).stem
 
-    srt_path = outdir / f"{stem}_gender_{stamp}_{rand4}.srt"
+    srt_path = outdir / f"{stem}_gender.srt"
     with srt_path.open("w", encoding="utf-8") as f:
         for i, seginfo in enumerate(segs, start=1):
             spk = seginfo["speaker"]
@@ -332,7 +332,7 @@ def main():
                 f"[{g}] (Speaker {spk})\n\n"
             )
 
-    seg_json = outdir / f"{stem}_gender_{stamp}_{rand4}_segments.json"
+    seg_json = outdir / f"{stem}_gender_segments.json"
     with seg_json.open("w", encoding="utf-8") as f:
         seg_dump = []
         for seginfo in segs:
@@ -351,7 +351,7 @@ def main():
             indent=2
         )
 
-    spk_json = outdir / f"{stem}_gender_{stamp}_{rand4}_speakers.json"
+    spk_json = outdir / f"{stem}_gender_speakers.json"
     with spk_json.open("w", encoding="utf-8") as f:
         json.dump({"speakers": speakers}, f, ensure_ascii=False, indent=2)
 
