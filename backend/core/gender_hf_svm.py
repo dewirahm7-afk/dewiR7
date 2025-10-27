@@ -122,9 +122,9 @@ def classify_speaker_gender(
     speaker_segments: List[Tuple[float, float]],
     *,
     device: str = "auto",
-    max_samples: int = 5,
-    min_len_sec: float = 1.0,
-    min_vote: float = 0.6,
+    max_samples: int = 1,
+    min_len_sec: float = 0.3,
+    min_vote: float = 0.7,
 ) -> Dict[str, object]:
     """
     Majority vote dari beberapa segmen -> "Male"/"Female"/"Unknown"

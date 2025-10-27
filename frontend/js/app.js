@@ -290,7 +290,7 @@ class DracinApp {
 					<!-- Top N Segments -->
 					<div>
 						<label class="block text-sm font-medium mb-2 text-gray-300">Top N Segments</label>
-						<input id="top-n" type="number" value="6"
+						<input id="top-n" type="number" value="5"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
 						<p class="text-xs text-gray-400 mt-1">Ambil segmen terpanjang speaker untuk analisis gender</p>
 					</div>
@@ -320,7 +320,7 @@ class DracinApp {
 
 					<div id="hf-minlen-wrap">
 						<label class="block text-sm font-medium mb-2 text-gray-300">min_len_sec</label>
-						<input id="min-len-sec" type="number" min="0.2" step="0.1" value="0.5"
+						<input id="min-len-sec" type="number" min="0.2" step="0.1" value="0.3"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
 						<p class="text-xs text-gray-400 mt-1">
 							Abaikan potongan suara yang terlalu pendek (teriak sepersekian detik)
@@ -846,7 +846,7 @@ class DracinApp {
 	  const female_ref    = (femaleRefEl?.value || '').trim();
 
 	  const min_vote      = (minVoteEl?.value || '0.7').trim();
-	  const min_len_sec   = (minLenEl?.value || '0.5').trim();
+	  const min_len_sec   = (minLenEl?.value || '0.3').trim();
 
 	  const top_n         = topNEl?.value ? parseInt(topNEl.value, 10) : 6;
 	  const hf_token      = (hfTokenEl?.value || '').trim();
@@ -3177,43 +3177,29 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
 }
 
 async edAutoSync() {
-  if (!this.currentSessionId) {
-    return this.showNotification('No active session', 'error');
-  }
-
-  const payload = {
-    snap_ms: 400,      // baris dianggap "butuh snap" jika selisih tengah >= 400ms
-    radius_ms: 1500,   // cari suara terdekat sampai 1.5 detik
-    mode: 'mid',       // jaga durasi subtitle tapi geser midpoint ke voice
-    only_warned: true  // cuma geser baris yang WARN, baris aman cuma re-label gender/speaker
-  };
-
-  this.showLoading('Auto-sync timing ke voice…');
+  if (!this.currentSessionId) return this.showNotification('No active session', 'error');
+  this.showLoading('Auto-syncing timing (V5)…');
   try {
-    const res = await fetch(
-      `/api/session/${encodeURIComponent(this.currentSessionId)}/editing/auto-sync`,
-      {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload),
-      }
-    );
-
+    const res = await fetch(`/api/session/${this.currentSessionId}/editing/auto-sync-v5`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        snap_ms: 400,
+        radius_ms: 600,
+        radius_near_ms: 2000,
+        min_gap_ms: 30,
+        min_dur_ms: 80
+      })
+    });
     const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data?.detail || 'Failed');
-    }
-
-    // reload tabel editing supaya UI pakai editing_cache.json terbaru
+    if (!res.ok) throw new Error(data?.detail || 'Failed');
     await this._edLoad(this.currentSessionId);
-
-    const stats = data.stats || {};
     this.showNotification(
-      `Auto-sync OK: ${data.rows_changed} rows | geser=${stats.changed_time} | relabel-only=${stats.relabel_only}`,
+      `Auto-sync V5 OK (anchors=${data.anchors}, a=${data.fit.a.toFixed(6)}, b=${data.fit.b_ms}ms; changed=${data.rows_changed}, g=${data.gender_changed}, sp=${data.speaker_changed})`,
       'success'
     );
   } catch (e) {
-    this.showNotification(`Auto-sync error: ${e.message || e}`, 'error');
+    this.showNotification(`Auto-sync error: ${e.message||e}`, 'error');
   } finally {
     this.hideLoading();
   }

@@ -1,26 +1,39 @@
 # ------------------------------------------------------------
-# dracin_gender.py (REVISED VERSION)
+# dracin_gender.py (CLEAN EXPORT VERSION)
 #
 # Pipeline:
-#   1. Diarization (pyannote 3.x) -> potongan segmen {start,end,speaker_local}
-#   2. Gender classification per-segmen langsung dari audio (hf_svm mode)
+#   1. Diarization (pyannote 3.x) -> potongan segmen {start, end, speaker_local}
+#   2. Gender classification PER SEGMEN langsung dari audio (hf_svm mode)
 #
 # Output:
+#
 #   <stem>_speaker_timeline_raw.json
-#       segments: [ {start, end, speaker} ... ]
+#       {
+#         "segments": [
+#           { "start": 12.34, "end": 13.20, "speaker": "SPEAKER_00" },
+#           ...
+#         ],
+#         "duration": ...
+#       }
 #
-#   <stem>_gender_timeline.json
-#       segments: [ {start, end, gender, speaker_local} ... ]
+#   <stem>_gender_timeline.json   <-- BERSIH
+#       {
+#         "segments": [
+#           { "start": 12.34, "end": 13.20, "gender": "Female" },
+#           ...
+#         ],
+#         "duration": ...
+#       }
 #
-# Catatan:
-# - DULU: gender ditentukan per speaker_local (by_spk) lalu ditempel ke semua segmen.
-#         Itu bikin kasus "speaker_19 = male semua", walau ada cewek.
-# - SEKARANG: gender diklasifikasi untuk SETIAP segmen langsung.
-#         Jadi tiap baris subtitle nanti bisa punya gender yang akurat per waktu,
-#         tanpa ikut rusaknya cluster speaker.
+#   <stem>_speakers_stats.json    <-- ringkasan mayoritas gender per speaker_local
 #
-# - Masih ada summary per speaker (speakers{}), tapi itu hanya statistik / debug,
-#   bukan sumber kebenaran final untuk timeline.
+# Catatan penting:
+# - DULU: gender = 1 label per speaker_local, lalu ditempel ke semua segmen -> salah kalau speaker_local campur cowok & cewek.
+# - SEKARANG:
+#     - gender dihitung PER SEGMEN audio, jadi tiap potongan punya gender sendiri.
+#     - timeline gender yang kita simpan KE FILE tidak bawa speaker_local (independen).
+#     - tapi secara internal kita masih simpan speaker_local supaya bisa bikin stats per speaker
+#       dan supaya processor bisa linking global speaker.
 #
 # ------------------------------------------------------------
 
@@ -51,7 +64,7 @@ def patched_torch_load(f, map_location=None, **kwargs):
 torch.load = patched_torch_load
 
 # MODE BARU (hf_svm)
-# -> ini fungsi dari core/gender_hf_svm.py
+# -> fungsi dari core/gender_hf_svm.py
 from core.gender_hf_svm import classify_speaker_gender as hf_gender_vote
 
 
@@ -109,7 +122,6 @@ class ECAPAEmbedder:
 
     @torch.inference_mode()
     def __call__(self, wav_1d: torch.Tensor) -> np.ndarray:
-        # wav_1d: torch.Tensor [T] pada 16k
         if wav_1d.dim() != 1:
             wav_1d = wav_1d.reshape(-1)
 
@@ -165,9 +177,9 @@ def main():
         help="(mode lama) ambil N segmen terpanjang per speaker untuk voting gender")
 
     # argumen KHUSUS mode hf_svm:
-    ap.add_argument("--min_vote", type=float, default=0.6,
+    ap.add_argument("--min_vote", type=float, default=0.7,
         help="hf_svm: kalau majority < min_vote => 'Unknown'")
-    ap.add_argument("--min_len_sec", type=float, default=1.0,
+    ap.add_argument("--min_len_sec", type=float, default=0.3,
         help="hf_svm: abaikan segmen < detik ini (teriakan sangat pendek, interupsi kecil)")
 
     args = ap.parse_args()
@@ -209,7 +221,7 @@ def main():
             segs.append({
                 "start": t0,
                 "end": t1,
-                "speaker": spk_label,   # <- label speaker lokal pyannote
+                "speaker": spk_label,   # "SPEAKER_00", "SPEAKER_01", ...
             })
 
     # group per speaker lokal (buat ringkasan statistik nanti)
@@ -228,11 +240,11 @@ def main():
     # MODE "hf_svm":    BARU, gender per segmen langsung
     # -------------------------------------------------
 
-    # speakers{} sekarang hanya ringkasan statistik per speaker_local
+    # speakers{} = ringkasan statistik per speaker_local
     speakers = {}
 
     if args.gender_mode == "reference":
-        # ========== MODE LAMA (masih disimpan buat backward compat) ==========
+        # ========== MODE LAMA (fallback compat) ==========
 
         embedder = ECAPAEmbedder(device=device, min_sec=1.2, sr=16000)
 
@@ -241,6 +253,8 @@ def main():
         fref_wav, _ = load_wav(Path(args.female_ref), target_sr=16000, mono=True)
         mref_emb = embedder(mref_wav.to(device))
         fref_emb = embedder(fref_wav.to(device))
+
+        segment_gender_map = []
 
         for spk, seg_list in by_spk.items():
             picks = seg_list[: max(1, args.top_n)]
@@ -273,10 +287,8 @@ def main():
                 "mode": "reference",
             }
 
-        # Di mode reference lama, kita TIDAK punya prediksi gender per segmen.
-        # Kita akan isi gender per segmen pakai speakers[seg.speaker]["gender"].
-
-        segment_gender_map = []
+        # untuk mode reference lama, kita gak punya gender per segmen individual
+        # jadi kita turunkan gender speaker ke semua segmen speaker tsb
         for seg in segs:
             g = speakers.get(seg["speaker"], {}).get("gender", "Unknown")
             segment_gender_map.append({
@@ -289,23 +301,21 @@ def main():
     else:
         # ========== MODE BARU: HF SVM ==========
         #
-        # Perbaikan BESAR:
-        #   - Kita klasifikasi gender LANGSUNG PER SEGMEN,
-        #     bukan voting sekali per speaker lalu tembak ke semua segmen.
-        #
-        #   - Setelah itu baru kita bikin summary per speaker_local (optional),
-        #     hanya untuk info/debug, bukan sumber kebenaran.
+        # - gender langsung per segmen
+        # - simpan speaker_local DI DALAM segment_gender_map supaya kita bisa bikin stats
+        #   tapi NANTI SAAT EXPORT gender_timeline.json TIDAK ditulis speaker_local.
         #
 
-        # 1) Gender PER SEGMEN
         segment_gender_map = []
+
+        # 1) Gender PER SEGMEN (bukan voting lintas segmen)
         for seg in segs:
             this_span = [(seg["start"], seg["end"])]
             info = hf_gender_vote(
                 wav_path=Path(args.audio),
                 speaker_segments=this_span,
                 device=("cuda" if (args.use_gpu and torch.cuda.is_available()) else "cpu"),
-                max_samples=1,           # kita cuma kasih 1 span ini
+                max_samples=1,           # pakai hanya segmen ini
                 min_len_sec=args.min_len_sec,
                 min_vote=args.min_vote,
             )
@@ -315,15 +325,16 @@ def main():
                 "start": seg["start"],
                 "end": seg["end"],
                 "gender": info["gender"],
+                "speaker_local": seg["speaker"],  # <- simpan INTERNAL
             })
 
-        # 2) Summary per speaker_local (opsional)
-        #    Ini buat manusia lihat statistik, bukan buat nempel gender global.
+        # 2) Summary per speaker_local (opsional, buat debug / analitik)
         tmp_votes = defaultdict(lambda: {"male":0.0, "female":0.0, "unknown":0.0, "dur":0.0})
         for item in segment_gender_map:
             spk = item["speaker_local"]
             g   = (item["gender"] or "Unknown").lower()
             dur = max(item["end"] - item["start"], 0.0)
+
             tmp_votes[spk]["dur"] += dur
             if g == "male":
                 tmp_votes[spk]["male"] += dur
@@ -336,6 +347,7 @@ def main():
             m = stat["male"]
             f = stat["female"]
             u = stat["unknown"]
+
             if m == 0 and f == 0:
                 final_g = "Unknown"
             elif m >= f and m >= u:
@@ -346,7 +358,7 @@ def main():
                 final_g = "Unknown"
 
             speakers[spk] = {
-                "gender": final_g,  # RINGKASAN MAYORITAS, boleh salah di lokal
+                "gender": final_g,  # mayoritas durasi speaker_local ini
                 "male_dur": m,
                 "female_dur": f,
                 "unknown_dur": u,
@@ -382,20 +394,21 @@ def main():
             indent=2,
         )
 
-    # 2) gender timeline mentah PER SEGMEN
-    #    -> ini krusial buat editor. Gender TIDAK LAGI dipaksa sama untuk seluruh speaker.
+    # 2) gender timeline per segmen (BERSIH, TANPA speaker_local)
+    #    -> inilah data final buat editor & auto-sync
+    gender_segments_export = []
+    for item in segment_gender_map:
+        gender_segments_export.append({
+            "start":  item["start"],
+            "end":    item["end"],
+            "gender": item["gender"],  # "Male"/"Female"/"Unknown"
+            # TIDAK ekspor speaker_local di sini
+        })
+
     with gender_tl_path.open("w", encoding="utf-8") as f:
         json.dump(
             {
-                "segments": [
-                    {
-                        "start": item["start"],
-                        "end": item["end"],
-                        "gender": item["gender"],          # "Male"/"Female"/"Unknown"
-                        "speaker_local": item["speaker_local"],
-                    }
-                    for item in segment_gender_map
-                ],
+                "segments": gender_segments_export,
                 "duration": full_dur,
             },
             f,
@@ -403,7 +416,7 @@ def main():
             indent=2,
         )
 
-    # 3) speaker summary (opsional, hanya buat debug / info UI tambahan)
+    # 3) speaker summary (opsional, hanya buat debug / analitik internal)
     with speakers_path.open("w", encoding="utf-8") as f:
         json.dump(
             speakers,

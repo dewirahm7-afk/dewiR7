@@ -128,13 +128,13 @@ class DiarizationEngine:
                 # Ambil parameter dari config
                 # ───────────────────────────────────────────
                 gender_mode = config.get("gender_mode", "reference")  # "reference" / "hf_svm"
-                top_n       = int(config.get("top_n", 6))
+                top_n       = int(config.get("top_n", 5))
                 hf_token    = (config.get("hf_token") or "").strip()
                 use_gpu     = bool(config.get("use_gpu", True))
 
                 # hanya dipakai mode hf_svm:
-                min_vote    = float(config.get("min_vote", 0.6))
-                min_len_sec = float(config.get("min_len_sec", 1.0))
+                min_vote    = float(config.get("min_vote", 0.7))
+                min_len_sec = float(config.get("min_len_sec", 0.3))
 
                 # hanya dipakai mode reference:
                 male_ref_in   = config.get("male_ref", "")
