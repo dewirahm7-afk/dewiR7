@@ -3177,20 +3177,49 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
 }
 
 async edAutoSync() {
-  if (!this.currentSessionId) return this.showNotification('No active session', 'error');
-  this.showLoading('Auto-syncing timing to voice…');
+  if (!this.currentSessionId) {
+    return this.showNotification('No active session', 'error');
+  }
+
+  const payload = {
+    snap_ms: 400,      // baris dianggap "butuh snap" jika selisih tengah >= 400ms
+    radius_ms: 1500,   // cari suara terdekat sampai 1.5 detik
+    mode: 'mid',       // jaga durasi subtitle tapi geser midpoint ke voice
+    only_warned: true  // cuma geser baris yang WARN, baris aman cuma re-label gender/speaker
+  };
+
+  this.showLoading('Auto-sync timing ke voice…');
   try {
-    const res = await fetch(`/api/session/${this.currentSessionId}/editing/auto-sync`, { method: 'POST' });
+    const res = await fetch(
+      `/api/session/${encodeURIComponent(this.currentSessionId)}/editing/auto-sync`,
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      }
+    );
+
     const data = await res.json();
-    if (!res.ok) throw new Error(data?.detail || 'Failed');
-    await this._edLoad(this.currentSessionId); // reload tabel dari server
-    this.showNotification(`Auto-sync OK (anchors=${data.anchors}, a=${data.fit.a.toFixed(4)}, b=${data.fit.b_ms}ms)`, 'success');
+    if (!res.ok) {
+      throw new Error(data?.detail || 'Failed');
+    }
+
+    // reload tabel editing supaya UI pakai editing_cache.json terbaru
+    await this._edLoad(this.currentSessionId);
+
+    const stats = data.stats || {};
+    this.showNotification(
+      `Auto-sync OK: ${data.rows_changed} rows | geser=${stats.changed_time} | relabel-only=${stats.relabel_only}`,
+      'success'
+    );
   } catch (e) {
-    this.showNotification(`Auto-sync error: ${e.message||e}`, 'error');
+    this.showNotification(`Auto-sync error: ${e.message || e}`, 'error');
   } finally {
     this.hideLoading();
   }
 }
+
+
 
 
 

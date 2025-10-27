@@ -17,7 +17,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from pathlib import Path
-
+from statistics import median
 from api.websockets import websocket_manager  # jika dipakai di tempat lain
 from core.processor import processing_manager
 from core.session_manager import session_manager
@@ -231,25 +231,40 @@ def make_export_filename(spk_id: str) -> str:
 @router.post("/api/session/{session_id}/editing/reset")
 def reset_editing_cache(session_id: str, pm = Depends(get_processing_manager)):
     """
-    Hapus editing_cache.json supaya frontend bisa rebuild dari diarization+translate terbaru.
+    Hapus editing_cache.json DAN edited_translated.srt supaya frontend bisa rebuild 
+    dari diarization+translate terbaru.
     WARNING: semua edit manual di tab Editing akan hilang.
     Frontend nanti akan panggil /api/session/{session_id}/editing lagi
     untuk rebuild cache baru dan reload tabel.
     """
-    ws = _ws(pm, session_id)  # util yg sama dipakai route editing lain
+    ws = _ws(pm, session_id)
     cache_p = ws / "editing_cache.json"
+    srt_p = ws / "edited_translated.srt"  # File SRT hasil edit
+
+    deleted_files = []
 
     try:
+        # Hapus editing_cache.json
         if cache_p.exists():
-            cache_p.unlink()  # delete file cache lama
+            cache_p.unlink()
+            deleted_files.append("editing_cache.json")
+
+        # Hapus edited_translated.srt
+        if srt_p.exists():
+            srt_p.unlink()
+            deleted_files.append("edited_translated.srt")
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Gagal hapus editing_cache.json: {e}"
+            detail=f"Gagal menghapus file: {e}"
         )
 
-    # balikin status sukses aja, frontend yg bakal reload tabel
-    return {"status": "reset_ok", "session_id": session_id}
+    return {
+        "status": "reset_ok",
+        "session_id": session_id,
+        "deleted_files": deleted_files  # Opsional: beri tahu frontend file mana yang terhapus
+    }
 
 @router.post("/api/session/{session_id}/diarization")
 async def run_diarization(
@@ -4268,3 +4283,301 @@ async def export_build_stream(
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson")
 
+def _ms_to_ts(ms: int) -> str:
+    """
+    ubah milidetik -> string SRT "hh:mm:ss,mmm"
+    contoh: 2641 -> "00:00:02,641"
+    """
+    if ms < 0:
+        ms = 0
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1_000
+    ms %= 1_000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _nearest_seg(segs, st_s, en_s, max_radius_s=1.5):
+    """
+    Fallback kalau gak ada overlap sama sekali:
+    ambil segmen voice yg midpoint-nya paling dekat dg midpoint subtitle,
+    SELAMA jarak <= max_radius_s (detik).
+
+    Penting: segs di projek kamu pakai "start_s"/"end_s",
+    bukan "start"/"end". Lihat _load_diarization_segments() yang
+    bikin seg seperti:
+      {
+        "start_s": float(...),
+        "end_s": float(...),
+        "speaker": "SPK_04",
+        "gender": "Male"
+      }
+    :contentReference[oaicite:1]{index=1}
+    """
+    sub_mid = 0.5 * (st_s + en_s)
+    best = None
+    best_dist = 1e9
+    for sg in segs:
+        sg_mid = 0.5 * (float(sg["start_s"]) + float(sg["end_s"]))
+        dist = abs(sg_mid - sub_mid)
+        if dist < best_dist and dist <= max_radius_s:
+            best = sg
+            best_dist = dist
+    return best
+
+
+def _load_speaker_gender_map(ws: Path):
+    """
+    Baca file *_gender_speakers.json terbaru dari workspace,
+    biar kita dapet mapping stabil speaker -> gender.
+    Format file ini di project kamu:
+      {
+        "speakers": {
+          "SPK_04": { "gender": "Male", ... },
+          "SPK_03": { "gender": "Female", ... }
+        }
+      }
+    Kita normalisasi jadi lowercase: male / female / unknown.
+    """
+    # cari file terbaru yg cocok pattern ini
+    cands = list(ws.glob("*_gender_speakers.json")) + list(ws.glob("**/*_gender_speakers.json"))
+    if not cands:
+        return {}
+    cands = sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True)
+    p = cands[0]
+
+    out = {}
+    try:
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+        data = json.loads(raw)
+        spkinfo = data.get("speakers") or {}
+        for spk, info in spkinfo.items():
+            g = (info.get("gender") or "unknown").lower()
+            if g not in ("male", "female", "unknown"):
+                g = "unknown"
+            out[spk] = g
+    except Exception:
+        pass
+
+    return out
+
+@router.post("/api/session/{session_id}/editing/auto-sync")
+def editing_auto_sync(
+    session_id: str,
+    body: dict = Body(None),
+    pm = Depends(get_processing_manager),
+):
+    """
+    Auto-sync V4.3 (start-only, end locked, no touch original SRT):
+    - Kita cuma edit editing_cache.json (state editor).
+    - Kita cuma geser START ke lebih awal supaya cocok dengan suara.
+    - END TIDAK DIUBAH (kecuali emergency durasi <80ms).
+    - Tidak pernah geser start jadi lebih lambat dari aslinya.
+    - Tidak pernah geser baris kalau telatnya < snap_ms.
+    """
+
+    ws = _ws(pm, session_id)
+
+    # parameter tuning
+    snap_ms    = int((body or {}).get("snap_ms", 400))        # minimal telat supaya kita berani geser
+    radius_ms  = int((body or {}).get("radius_ms", 1500))     # cari speaker terdekat dalam radius <= 1.5s
+    min_dur_ms = 80                                           # jangan bikin subtitle <80ms
+
+    only_warned = bool((body or {}).get("only_warned", True)) # true: cuma geser kalau telat besar
+
+    # 1. ambil state editing sekarang
+    rows = _load_rows(ws)  # -> [{'index', 'start_ms', 'end_ms', 'gender', ...}, ...]
+    if not rows:
+        raise HTTPException(400, "Tidak ada row di editing_cache.json")
+
+    # sort by waktu supaya baris urut
+    rows_sorted = sorted(rows, key=lambda r: (r["start_ms"], r["index"]))
+
+    # 2. ambil segmen voice (sumber kebenaran timing & speaker/gender)
+    segs = _load_diarization_segments(ws)
+    if not segs:
+        raise HTTPException(404, "File *_gender_segments.json tidak ditemukan di workspace")
+
+    # 3. ambil map speaker->gender stabil
+    spk_gender_map = _load_speaker_gender_map(ws)
+
+    out_rows = []
+    stats_changed_time = 0
+    stats_relabel_only = 0
+    stats_no_candidate = 0
+    stats_used_overlap = 0
+    stats_used_nearest = 0
+
+    for i, r in enumerate(rows_sorted):
+        orig_start = int(r["start_ms"])
+        orig_end   = int(r["end_ms"])
+
+        # jaga minimal durasi baseline
+        if orig_end < orig_start + min_dur_ms:
+            orig_end = orig_start + min_dur_ms
+
+        # cari segmen voice yg cocok dengan waktu SEKARANG
+        st_s = orig_start / 1000.0
+        en_s = orig_end   / 1000.0
+
+        seg_pick = _best_overlap(segs, st_s, en_s)
+        used_near = False
+
+        if seg_pick:
+            stats_used_overlap += 1
+        else:
+            seg_pick = _nearest_seg(segs, st_s, en_s, max_radius_s=radius_ms/1000.0)
+            if seg_pick:
+                used_near = True
+                stats_used_nearest += 1
+
+        # step 1: hitung start yang ideal BERDASARKAN SUARA
+        # voice_start_ms = kapan segmen suara mulai bicara
+        # delta = voice_start_ms - orig_start
+        # kalau delta < 0 artinya suara mulai duluan -> subtitle telat -> kita harus majukan start
+        # kalau delta > 0 artinya subtitle malah lebih cepat -> JANGAN ditunda, biarin
+        if seg_pick:
+            voice_start_ms = int(round(float(seg_pick["start_s"]) * 1000.0))
+            delta_start_ms = voice_start_ms - orig_start
+        else:
+            voice_start_ms = None
+            delta_start_ms = None
+
+        # default: tidak geser
+        new_start = orig_start
+        new_end   = orig_end  # END DIKUNCI
+
+        # kita cuma geser kalau:
+        # - kita punya kandidat segmen suara
+        # - delta_start_ms NEGATIF (artinya subtitle telat, perlu dimajuin)
+        # - selisihnya cukup besar (>= snap_ms) ATAU only_warned=False
+        if seg_pick and delta_start_ms is not None:
+            # delta_start_ms < 0 berarti suara mulai LEBIH AWAL daripada teks (teks telat)
+            if delta_start_ms < 0:
+                # kita cuma majukan start, jadi shift_advance adalah nilai negatif
+                shift_advance = delta_start_ms  # contoh: -600 ms
+                if only_warned and abs(shift_advance) < snap_ms:
+                    # telatnya kecil, jangan otak-atik
+                    shift_advance = 0
+                # jangan pernah bikin subtitle lebih lambat dari aslinya
+                # jadi kalau shift_advance > 0 (artinya mau bikin makin telat) -> nolkan
+                if shift_advance > 0:
+                    shift_advance = 0
+
+                candidate_start = orig_start + shift_advance  # ini <= orig_start (lebih awal atau sama)
+
+                # jangan sampai overlap dengan baris sebelumnya:
+                if out_rows:
+                    prev_end_fixed = out_rows[-1]["end_ms"]  # END baris sebelumnya sudah fix
+                    if candidate_start < prev_end_fixed:
+                        candidate_start = prev_end_fixed
+
+                # jangan sampai start melewati END baris sendiri
+                if candidate_start > orig_end - min_dur_ms:
+                    candidate_start = max(orig_end - min_dur_ms, 0)
+
+                new_start = candidate_start
+                new_end   = orig_end  # end tetap
+
+        # track statistik
+        if new_start != orig_start:
+            stats_changed_time += 1
+        else:
+            stats_relabel_only += 1
+
+        if not seg_pick:
+            stats_no_candidate += 1
+
+        # assign speaker & gender untuk interval FINAL [new_start, new_end]
+        st2_s = new_start / 1000.0
+        en2_s = new_end   / 1000.0
+
+        seg_pick2 = _best_overlap(segs, st2_s, en2_s)
+        if not seg_pick2:
+            seg_pick2 = _nearest_seg(segs, st2_s, en2_s, max_radius_s=radius_ms/1000.0)
+
+        if seg_pick2:
+            speaker_val = (seg_pick2.get("speaker") or "").strip()
+            gender_val  = (seg_pick2.get("gender") or "unknown").lower()
+        else:
+            # fallback pakai nilai lama kalau ga nemu kandidat
+            speaker_val = (r.get("speaker") or "").strip()
+            gender_val  = (r.get("gender") or "unknown").lower()
+
+        # stabilkan gender lewat speaker map global
+        if (not gender_val or gender_val == "unknown") and speaker_val in spk_gender_map:
+            gender_val = spk_gender_map[speaker_val]
+
+        out_rows.append({
+            "index":   r["index"],
+            "start_ms": new_start,
+            "end_ms":   new_end,
+            "speaker":  speaker_val,
+            "gender":   gender_val,
+        })
+
+    # 4. tulis balik KE editing_cache.json SAJA
+    ec = ws / "editing_cache.json"
+    cache_obj = json.loads(ec.read_text(encoding="utf-8", errors="ignore"))
+    cache_rows = cache_obj.get("rows") if isinstance(cache_obj, dict) else None
+    if not isinstance(cache_rows, list):
+        raise HTTPException(400, "Format editing_cache.json tidak dikenali")
+
+    # index -> hasil baru
+    final_by_index = {row["index"]: row for row in out_rows}
+
+    rows_changed_total = 0
+    for rec in cache_rows:
+        try:
+            ridx = int(rec.get("index"))
+        except Exception:
+            continue
+        upd = final_by_index.get(ridx)
+        if not upd:
+            continue
+
+        # START berubah? ya tulis string barunya
+        rec["start"] = _ms_to_ts(upd["start_ms"])
+        # END TETAP sama seperti sebelumnya,
+        # JANGAN ganti rec["end"] pakai ms_to_ts(upd["end_ms"]) kalau itu beda.
+        # Jadi kita TIDAK menyentuh .end kecuali darurat durasi <80ms
+        # Cek apakah end_ms harus dipanjangin darurat
+        safe_end_ms = max(upd["end_ms"], upd["start_ms"] + min_dur_ms)
+        rec["end"] = _ms_to_ts(safe_end_ms)
+
+        # eff_* di cache adalah tampilan raw ms untuk pemrosesan lanjutan.
+        if "eff_start_ms" in rec:
+            rec["eff_start_ms"] = upd["start_ms"]
+        if "eff_end_ms" in rec:
+            # kita tetap isi eff_end_ms sama end existing (safe_end_ms), tapi konsepnya masih "end fix"
+            rec["eff_end_ms"] = safe_end_ms
+
+        if "speaker" in rec:
+            rec["speaker"] = upd["speaker"]
+        if "gender" in rec:
+            rec["gender"]  = upd["gender"]
+
+        rows_changed_total += 1
+
+    ec.write_text(json.dumps(cache_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    meta = {
+        "rows_changed": rows_changed_total,
+        "snap_ms": snap_ms,
+        "radius_ms": radius_ms,
+        "only_warned": only_warned,
+        "stats": {
+            "changed_time": stats_changed_time,
+            "relabel_only": stats_relabel_only,
+            "no_candidate": stats_no_candidate,
+            "used_overlap": stats_used_overlap,
+            "used_nearest": stats_used_nearest,
+        },
+        "note": "Hanya START yang boleh berubah. END dianggap kunci & tidak digeser."
+    }
+
+    (ws / "editing_auto_sync.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    return JSONResponse({"ok": True, **meta})
