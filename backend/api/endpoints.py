@@ -349,21 +349,16 @@ async def run_diarization(
         }
 
         # jalankan pipeline diarization + gender + (opsional) global linking
+        # jalankan pipeline diarization + gender
         result = await pm.run_diarization(session_id, cfg)
 
-        # ProcessingManager diharapkan balikin dict minimal:
-        # {
-        #   "segments_path": <path ke *_segments.json final>,
-        #   "speakers_path": <path ke *_speakers.json final>
-        # }
-
-        return JSONResponse(
-            {
-                "status": "diarization_completed",
-                "segments_path": str(result["segments_path"]),
-                "speakers_path": str(result["speakers_path"]),
-            }
-        )
+        # result sekarang berisi path 3 file timeline baru
+        return JSONResponse({
+            "status": "diarization_completed",
+            "speaker_timeline_raw":    result["speaker_timeline_raw"],
+            "speaker_timeline_linked": result["speaker_timeline_linked"],
+            "gender_timeline":         result["gender_timeline"],
+        })
 
     except Exception as e:
         import traceback
@@ -1276,11 +1271,11 @@ def get_editing(
     # 3) Map diarization SECARA TERPISAH: speaker vs gender
     # ------------------------------------------------------------------ #
     # 3a) muat dua jalur terpisah
-    spk_segs_raw = _load_speaker_segments(d)    # [{start/end, speaker}]
-    gen_segs_raw = _load_gender_segments(d)     # [{start/end, gender}]
+    spk_segs_raw = _load_speaker_segments(d)    # [{start,end,speaker}]
+    gen_segs_raw = _load_gender_segments(d)     # [{start,end,gender}]
 
     # fallback: kalau salah satu kosong, pakai segs gabungan lama
-    base_segs = _load_diarization_segments(d)   # gabungan lama (bisa ada 'speaker' dan 'gender')
+    base_segs = _load_diarization_segments(d)   # legacy gabungan [{start_s,end_s,speaker,gender}, ...]
     if (not spk_segs_raw) and base_segs:
         tmp = []
         for s in base_segs or []:
@@ -1290,7 +1285,7 @@ def get_editing(
                     "end":   float(s.get("end",   s.get("end_s",   0.0))),
                     "speaker": s.get("speaker"),
                 })
-            except:
+            except Exception:
                 pass
         spk_segs_raw = tmp
 
@@ -1299,18 +1294,18 @@ def get_editing(
         for s in base_segs or []:
             try:
                 g = (s.get("gender") or "unknown").lower()
-                if g not in ("male","female","unknown"):
+                if g not in ("male", "female", "unknown"):
                     g = "unknown"
                 tmp.append({
                     "start": float(s.get("start", s.get("start_s", 0.0))),
                     "end":   float(s.get("end",   s.get("end_s",   0.0))),
                     "gender": g,
                 })
-            except:
+            except Exception:
                 pass
         gen_segs_raw = tmp
 
-    # 3b) NORMALISASI: pastikan semua pakai start_s/end_s (AMAN utk _collect_boundaries/_pick_segment lama)
+    # 3b) NORMALISASI jadi {start_s,end_s,speaker} / {start_s,end_s,gender}
     spk_segs = _norm_seg_list(spk_segs_raw, keep=["speaker"])
     gen_segs = _norm_seg_list(gen_segs_raw, keep=["gender"])
 
@@ -3336,69 +3331,171 @@ def _load_json_safely(p: Optional[Path]):
     except Exception:
         return []
 
-def _load_speaker_segments(ws: Path):
-    """
-    Prefer file *_speakers.json (ringkasan per-segmen dari jalur SPEAKER).
-    Format keluaran: [{start: float(sec), end: float(sec), speaker: 'SPK_01'}, ...]
-    """
-    p = _latest(ws, "*_speakers.json")
-    arr = _load_json_safely(p)
-    out = []
-    for it in arr or []:
-        try:
-            out.append({
-                "start": float(it.get("start", it.get("start_s", 0.0))),
-                "end":   float(it.get("end", it.get("end_s", 0.0))),
-                "speaker": (it.get("speaker") or it.get("spk") or None),
-            })
-        except:
-            pass
-    return out
+# ==== NEW HELPERS FOR SEPARATED SPEAKER/GENDER TIMELINES  Tab Editing  =====================
+# Ini yang bikin speaker & gender per baris jadi akurat.
 
-def _load_gender_segments(ws: Path):
+def _latest_in_tree(workdir: Path, patterns: List[str]) -> Optional[Path]:
     """
-    Prefer file *_segments.json (per-segmen dari jalur GENDER).
-    Format keluaran: [{start: float(sec), end: float(sec), gender: 'male|female|unknown'}, ...]
+    Cari file terbaru yg cocok pattern (di root workspace atau subfolder).
+    Contoh:
+      _latest_in_tree(ws, ["speaker_timeline_linked.json"])
     """
-    p = _latest(ws, "*_segments.json")
-    arr = _load_json_safely(p)
-    out = []
-    for it in arr or []:
-        try:
-            g = (it.get("gender") or it.get("gen") or "unknown").lower()
-            if g not in ("male", "female", "unknown"):
-                g = "unknown"
-            out.append({
-                "start": float(it.get("start", it.get("start_s", 0.0))),
-                "end":   float(it.get("end", it.get("end_s", 0.0))),
-                "gender": g,
-            })
-        except:
-            pass
-    return out
+    cands = []
+    for pat in patterns:
+        cands += list(workdir.glob(pat))
+        cands += list(workdir.glob(f"**/{pat}"))
+    if not cands:
+        return None
+    # buang duplikat path yg sama
+    uniq = {str(p.resolve()): p for p in cands}.values()
+    # ambil yang mtime paling baru
+    return sorted(uniq, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-def _norm_seg_list(seg_list, keep=None):
+
+def _norm_seg_list(rows_raw: List[dict], keep: List[str]) -> List[dict]:
     """
-    Input: list of dict dengan kemungkinan kunci waktu bervariasi: start_s/end_s atau start/end.
-    Output: list of dict dengan kunci pasti 'start_s' dan 'end_s', plus field lain (mis. speaker/gender).
+    Normalisasi list segmen jadi bentuk:
+      { "start_s": float, "end_s": float, <field lain yg diminta di 'keep'> }
+
+    rows_raw boleh punya "start"/"end"
+    atau "start_s"/"end_s".
     """
     out = []
-    for s in seg_list or []:
+    for r in rows_raw or []:
         try:
-            st = s.get("start_s", s.get("start", s.get("start_time")))
-            en = s.get("end_s",   s.get("end",   s.get("end_time")))
-            if st is None or en is None:
-                continue
-            item = {"start_s": float(st), "end_s": float(en)}
-            if keep:
-                for k in keep:
-                    if k in s:
-                        item[k] = s[k]
-            out.append(item)
+            s0 = float(r.get("start", r.get("start_s", 0.0)))
+            e0 = float(r.get("end",   r.get("end_s",   0.0)))
         except Exception:
-            # skip baris yang aneh
-            pass
+            continue
+        if e0 <= s0:
+            continue
+
+        item = {
+            "start_s": s0,
+            "end_s": e0,
+        }
+        for k in keep:
+            if k in r:
+                item[k] = r[k]
+        out.append(item)
     return out
+
+
+def _load_speaker_segments(workdir: Path) -> List[dict]:
+    """
+    Kembalikan list:
+      [ { "start": <float>, "end": <float>, "speaker": "SPK_01" }, ... ]
+
+    Urutan preferensi file:
+      1. speaker_timeline_linked.json (HASIL SETELAH GLOBAL LINKING)
+      2. *_speaker_timeline_raw.json  (HASIL LANGSUNG dr dracin_gender.py)
+
+    Kenapa pakai dua level:
+    - Kalau processor.py sudah bikin SPK_01/02, pakai yang itu.
+    - Kalau belum, minimal kita masih dapat SPEAKER_00/SPEAKER_01 dari raw.
+    """
+    # coba versi linked global dulu
+    p = _latest_in_tree(workdir, ["speaker_timeline_linked.json"])
+    if not p:
+        # fallback ke raw dari dracin_gender.py
+        p = _latest_in_tree(workdir, ["*_speaker_timeline_raw.json"])
+    if not p:
+        return []
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return []
+
+    rows_raw = []
+    # data di file kita expect LIST of {start,end,speaker}
+    if isinstance(data, list):
+        for seg in data:
+            try:
+                s0 = float(seg.get("start", seg.get("start_s", 0.0)))
+                e0 = float(seg.get("end",   seg.get("end_s",   0.0)))
+                spk = seg.get("speaker")
+            except Exception:
+                continue
+            rows_raw.append({
+                "start": s0,
+                "end": e0,
+                "speaker": spk,
+            })
+    else:
+        # kalau entah kenapa bukan list (misal dict lama), kita coba baca "segments"
+        for seg in data.get("segments", []):
+            try:
+                s0 = float(seg.get("start", seg.get("start_s", 0.0)))
+                e0 = float(seg.get("end",   seg.get("end_s",   0.0)))
+                spk = seg.get("speaker")
+            except Exception:
+                continue
+            rows_raw.append({
+                "start": s0,
+                "end": e0,
+                "speaker": spk,
+            })
+
+    return rows_raw
+
+
+def _load_gender_segments(workdir: Path) -> List[dict]:
+    """
+    Kembalikan list:
+      [ { "start": <float>, "end": <float>, "gender": "male"/"female"/"unknown" }, ... ]
+
+    Sumber:
+      *_gender_timeline.json
+    (file baru dari dracin_gender.py yang sudah kamu tambahkan)
+    """
+    p = _latest_in_tree(workdir, ["*_gender_timeline.json"])
+    if not p:
+        return []
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return []
+
+    rows_raw = []
+    if isinstance(data, list):
+        for seg in data:
+            try:
+                s0 = float(seg.get("start", seg.get("start_s", 0.0)))
+                e0 = float(seg.get("end",   seg.get("end_s",   0.0)))
+                g0 = (seg.get("gender") or "unknown").strip().lower()
+            except Exception:
+                continue
+
+            if g0 not in ("male", "female", "unknown"):
+                g0 = "unknown"
+
+            rows_raw.append({
+                "start": s0,
+                "end": e0,
+                "gender": g0,
+            })
+    else:
+        # sama fallback pattern "segments" kalau format gak sesuai
+        for seg in data.get("segments", []):
+            try:
+                s0 = float(seg.get("start", seg.get("start_s", 0.0)))
+                e0 = float(seg.get("end",   seg.get("end_s",   0.0)))
+                g0 = (seg.get("gender") or "unknown").strip().lower()
+            except Exception:
+                continue
+            if g0 not in ("male", "female", "unknown"):
+                g0 = "unknown"
+            rows_raw.append({
+                "start": s0,
+                "end": e0,
+                "gender": g0,
+            })
+
+    return rows_raw
+# ==== END NEW HELPERS Tab Editing ========================================================
+
     
 @router.post("/api/session/{session_id}/export/preview-audio")
 def export_preview_audio(session_id: str, body: dict = Body(...), pm = Depends(get_processing_manager)):
@@ -4299,285 +4396,433 @@ def _ms_to_ts(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _nearest_seg(segs, st_s, en_s, max_radius_s=1.5):
-    """
-    Fallback kalau gak ada overlap sama sekali:
-    ambil segmen voice yg midpoint-nya paling dekat dg midpoint subtitle,
-    SELAMA jarak <= max_radius_s (detik).
+# =========================
+# HELPER V5 (TIMELINE-BASED)
+# =========================
 
-    Penting: segs di projek kamu pakai "start_s"/"end_s",
-    bukan "start"/"end". Lihat _load_diarization_segments() yang
-    bikin seg seperti:
-      {
-        "start_s": float(...),
-        "end_s": float(...),
-        "speaker": "SPK_04",
-        "gender": "Male"
-      }
-    :contentReference[oaicite:1]{index=1}
+def _tl5_read_json_latest(ws: Path, pattern: str):
     """
-    sub_mid = 0.5 * (st_s + en_s)
+    Ambil file terbaru yang cocok pattern di workspace session,
+    return parsed JSON atau None kalau ga ada.
+    """
+    cands = sorted(ws.glob(pattern))
+    if not cands:
+        return None
+    latest = cands[-1]
+    try:
+        return _load_json_safely(latest)
+    except Exception:
+        return None
+
+
+def _tl5_load_gender_timeline(ws: Path):
+    """
+    Load gender timeline mentah (per SEGMEN audio, bukan per speaker),
+    hasil dracin_gender.py baru -> *_gender_timeline.json
+
+    Return list of dict:
+      { "start_ms": ..., "end_ms": ..., "gender": "female"/"male"/"unknown" }
+    """
+    obj = _tl5_read_json_latest(ws, "*_gender_timeline.json")
+    if not obj or "segments" not in obj:
+        return []
+
+    out = []
+    for seg in obj["segments"]:
+        try:
+            st_ms = int(round(float(seg["start"]) * 1000.0))
+            en_ms = int(round(float(seg["end"])   * 1000.0))
+        except Exception:
+            continue
+
+        g = (seg.get("gender") or "unknown").strip().lower()
+        out.append({
+            "start_ms": st_ms,
+            "end_ms":   en_ms,
+            "gender":   g,
+            # opsional: simpan speaker_local kalau ada (buat debug)
+            "speaker_local": seg.get("speaker_local", ""),
+        })
+    return out
+
+
+def _tl5_load_speaker_timeline_linked(ws: Path):
+    """
+    Load timeline speaker+gender per segmen yang sudah di-link global
+    hasil processor.py ("*_speaker_timeline_linked.json").
+
+    Fallback ke *_speaker_timeline_raw.json kalau linked belum ada.
+
+    Return list of dict:
+      {
+        "start_ms": ...,
+        "end_ms": ...,
+        "speaker": "SPK_07" (global) ATAU speaker_local,
+        "speaker_local": "SPEAKER_00",
+        "gender": "female"/"male"/"unknown"
+      }
+    """
+    obj = _tl5_read_json_latest(ws, "*_speaker_timeline_linked.json")
+    if (not obj) or ("segments" not in obj):
+        # fallback ke raw
+        obj = _tl5_read_json_latest(ws, "*_speaker_timeline_raw.json")
+
+    if not obj or "segments" not in obj:
+        return []
+
+    out = []
+    for seg in obj["segments"]:
+        try:
+            st_ms = int(round(float(seg["start"]) * 1000.0))
+            en_ms = int(round(float(seg["end"])   * 1000.0))
+        except Exception:
+            continue
+
+        spk_global = (
+            seg.get("speaker")
+            or seg.get("speaker_global")
+            or seg.get("spk_global")
+            or seg.get("speaker_local")
+            or ""
+        )
+
+        g_guess = (
+            seg.get("gender")
+            or seg.get("gender_local")
+            or seg.get("gender_guess")
+            or "unknown"
+        )
+        g_guess = str(g_guess).strip().lower()
+
+        out.append({
+            "start_ms":      st_ms,
+            "end_ms":        en_ms,
+            "speaker":       spk_global,
+            "speaker_local": seg.get("speaker_local", ""),
+            "gender":        g_guess,
+        })
+    return out
+
+
+def _tl5_best_overlap(timeline, q_st_ms: int, q_en_ms: int):
+    """
+    Cari segmen di timeline yang overlap PALING BESAR
+    dengan interval [q_st_ms, q_en_ms].
+    """
     best = None
-    best_dist = 1e9
-    for sg in segs:
-        sg_mid = 0.5 * (float(sg["start_s"]) + float(sg["end_s"]))
-        dist = abs(sg_mid - sub_mid)
-        if dist < best_dist and dist <= max_radius_s:
-            best = sg
-            best_dist = dist
+    best_score = -1.0
+    for seg in timeline:
+        ov_st = max(q_st_ms, seg["start_ms"])
+        ov_en = min(q_en_ms, seg["end_ms"])
+        ov = ov_en - ov_st
+        if ov <= 0:
+            continue
+        if ov > best_score:
+            best = seg
+            best_score = ov
     return best
 
 
-def _load_speaker_gender_map(ws: Path):
+def _tl5_nearest_seg(timeline, q_st_ms: int, q_en_ms: int, max_radius_ms: int):
     """
-    Baca file *_gender_speakers.json terbaru dari workspace,
-    biar kita dapet mapping stabil speaker -> gender.
-    Format file ini di project kamu:
-      {
-        "speakers": {
-          "SPK_04": { "gender": "Male", ... },
-          "SPK_03": { "gender": "Female", ... }
-        }
-      }
-    Kita normalisasi jadi lowercase: male / female / unknown.
+    Kalau gak ada overlap sama sekali, cari segmen terdekat
+    (jarak minimum antara mid row dan segmen).
+    Batasi jarak pakai max_radius_ms. Kalau terlalu jauh -> None.
     """
-    # cari file terbaru yg cocok pattern ini
-    cands = list(ws.glob("*_gender_speakers.json")) + list(ws.glob("**/*_gender_speakers.json"))
-    if not cands:
-        return {}
-    cands = sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True)
-    p = cands[0]
+    mid = (q_st_ms + q_en_ms) / 2.0
+    best = None
+    best_dist = None
+    for seg in timeline:
+        if seg["end_ms"] < mid:
+            dist = mid - seg["end_ms"]
+        elif seg["start_ms"] > mid:
+            dist = seg["start_ms"] - mid
+        else:
+            dist = 0.0
+        if (best_dist is None) or (dist < best_dist):
+            best = seg
+            best_dist = dist
+    if best_dist is None:
+        return None
+    if max_radius_ms is not None and best_dist > max_radius_ms:
+        return None
+    return best
 
-    out = {}
-    try:
-        raw = p.read_text(encoding="utf-8", errors="ignore")
-        data = json.loads(raw)
-        spkinfo = data.get("speakers") or {}
-        for spk, info in spkinfo.items():
-            g = (info.get("gender") or "unknown").lower()
-            if g not in ("male", "female", "unknown"):
-                g = "unknown"
-            out[spk] = g
-    except Exception:
-        pass
 
-    return out
+# ============================================
+# AUTO-SYNC V5 (START-only, END locked, voice)
+# ============================================
 
 @router.post("/api/session/{session_id}/editing/auto-sync")
-def editing_auto_sync(
+def editing_auto_sync_v5(
     session_id: str,
     body: dict = Body(None),
     pm = Depends(get_processing_manager),
 ):
     """
-    Auto-sync V4.3 (start-only, end locked, no touch original SRT):
-    - Kita cuma edit editing_cache.json (state editor).
-    - Kita cuma geser START ke lebih awal supaya cocok dengan suara.
-    - END TIDAK DIUBAH (kecuali emergency durasi <80ms).
-    - Tidak pernah geser start jadi lebih lambat dari aslinya.
-    - Tidak pernah geser baris kalau telatnya < snap_ms.
+    Auto-sync V5:
+    - Pilar: VOICE TIMELINE (bukan OCR).
+    - Hanya geser START subtitle (majuin ke suara).
+      END baris DIKUNCI (tetap).
+    - Tidak sengaja menunda subtitle (kita gak bikin muncul lebih LAMBAT),
+      kecuali terpaksa demi jarak aman antar baris.
+    - Update speaker & gender per baris dari voice segmen terdekat.
+    - Jangan pernah nyentuh file SRT asli (translated_latest.srt dll).
+    - Hasil akhirnya disimpan lagi ke editing_cache.json dan
+      meta disimpan ke editing_auto_sync.json
     """
 
     ws = _ws(pm, session_id)
 
-    # parameter tuning
-    snap_ms    = int((body or {}).get("snap_ms", 400))        # minimal telat supaya kita berani geser
-    radius_ms  = int((body or {}).get("radius_ms", 1500))     # cari speaker terdekat dalam radius <= 1.5s
-    min_dur_ms = 80                                           # jangan bikin subtitle <80ms
+    # ====== PARAM USER / DEFAULT ======
+    snap_ms        = int((body or {}).get("snap_ms", 400))
+    radius_ms      = int((body or {}).get("radius_ms", 1000))
+    radius_near_ms = int((body or {}).get("radius_near_ms", 2000))
+    min_gap_ms     = int((body or {}).get("min_gap_ms", 30))
+    min_dur_ms     = int((body or {}).get("min_dur_ms", 80))
 
-    only_warned = bool((body or {}).get("only_warned", True)) # true: cuma geser kalau telat besar
-
-    # 1. ambil state editing sekarang
-    rows = _load_rows(ws)  # -> [{'index', 'start_ms', 'end_ms', 'gender', ...}, ...]
+    # ====== 1) MUAT rows dari editing_cache.json ======
+    rows = _load_rows(ws)
     if not rows:
-        raise HTTPException(400, "Tidak ada row di editing_cache.json")
+        raise HTTPException(400, "Tidak ada row di editing_cache.json. Jalankan /editing/reset dulu.")
 
-    # sort by waktu supaya baris urut
-    rows_sorted = sorted(rows, key=lambda r: (r["start_ms"], r["index"]))
+    # Sort by index biar prev_end aman
+    rows_sorted = sorted(rows, key=lambda r: int(r["index"]))
 
-    # 2. ambil segmen voice (sumber kebenaran timing & speaker/gender)
-    segs = _load_diarization_segments(ws)
-    if not segs:
-        raise HTTPException(404, "File *_gender_segments.json tidak ditemukan di workspace")
+    # ====== 2) MUAT timeline dari diarization V5 ======
+    speaker_tl = _tl5_load_speaker_timeline_linked(ws)
+    gender_tl  = _tl5_load_gender_timeline(ws)
 
-    # 3. ambil map speaker->gender stabil
-    spk_gender_map = _load_speaker_gender_map(ws)
+    if not speaker_tl and not gender_tl:
+        raise HTTPException(409, "Voice timeline tidak ditemukan. Jalankan diarization dulu sebelum Auto-sync.")
 
-    out_rows = []
-    stats_changed_time = 0
-    stats_relabel_only = 0
-    stats_no_candidate = 0
-    stats_used_overlap = 0
-    stats_used_nearest = 0
+    # ====== 3) BANGUN ANCHOR PAIRS buat statistik offset global ======
+    # pairs_ms = list of (subtitle_start_ms, voice_start_ms)
+    pairs_ms = []
+    used_overlap_ct = 0
+    used_nearest_ct = 0
 
-    for i, r in enumerate(rows_sorted):
-        orig_start = int(r["start_ms"])
-        orig_end   = int(r["end_ms"])
+    for r in rows_sorted:
+        orig_st_ms = int(r["start_ms"])
+        orig_en_ms = int(r["end_ms"])
 
-        # jaga minimal durasi baseline
-        if orig_end < orig_start + min_dur_ms:
-            orig_end = orig_start + min_dur_ms
+        # prioritas cari di speaker timeline
+        pick = _tl5_best_overlap(speaker_tl, orig_st_ms, orig_en_ms)
+        if pick:
+            used_overlap_ct += 1
+        if not pick:
+            pick = _tl5_best_overlap(gender_tl, orig_st_ms, orig_en_ms)
+            if pick:
+                used_overlap_ct += 1
+        if not pick:
+            pick = _tl5_nearest_seg(speaker_tl, orig_st_ms, orig_en_ms, radius_near_ms)
+            if pick:
+                used_nearest_ct += 1
+        if (not pick) and gender_tl:
+            tmp = _tl5_nearest_seg(gender_tl, orig_st_ms, orig_en_ms, radius_near_ms)
+            if tmp:
+                pick = tmp
+                used_nearest_ct += 1
 
-        # cari segmen voice yg cocok dengan waktu SEKARANG
-        st_s = orig_start / 1000.0
-        en_s = orig_end   / 1000.0
+        if not pick:
+            continue
 
-        seg_pick = _best_overlap(segs, st_s, en_s)
-        used_near = False
+        voice_st_ms = int(pick["start_ms"])
+        pairs_ms.append((float(orig_st_ms), float(voice_st_ms)))
 
-        if seg_pick:
-            stats_used_overlap += 1
+    anchors = len(pairs_ms)
+
+    # hitung regresi linear di ms -> ms (hanya buat reporting/debug)
+    a = 1.0
+    b_ms = 0.0
+    if anchors >= 2:
+        n = float(anchors)
+        sx  = sum(x for x, _ in pairs_ms)
+        sy  = sum(y for _, y in pairs_ms)
+        sx2 = sum(x*x for x, _ in pairs_ms)
+        sxy = sum(x*y for x, y in pairs_ms)
+        denom = (n*sx2 - sx*sx)
+        if abs(denom) > 1e-12:
+            a = (n*sxy - sx*sy) / denom
+            b_ms = (sy - a*sx) / n
+    elif anchors == 1:
+        sx, sy = pairs_ms[0]
+        a = 1.0
+        b_ms = sy - sx
+
+    # clamp drift biar lucu
+    if a < 0.98: a = 0.98
+    if a > 1.02: a = 1.02
+
+    # ====== 4) PROSES BARIS SATU-PER-SATU ======
+    final_by_index = {}
+    rows_changed_total = 0
+
+    prev_final_end_ms = None  # buat jaga jarak antar subtitle
+
+    for r in rows_sorted:
+        idx        = int(r["index"])
+        orig_st_ms = int(r["start_ms"])
+        orig_en_ms = int(r["end_ms"])
+
+        # Cari best voice segmen utk baris ini
+        pick_spk = _tl5_best_overlap(speaker_tl, orig_st_ms, orig_en_ms)
+        if not pick_spk:
+            pick_spk = _tl5_best_overlap(gender_tl, orig_st_ms, orig_en_ms)
+        if not pick_spk:
+            pick_spk = _tl5_nearest_seg(speaker_tl, orig_st_ms, orig_en_ms, radius_near_ms)
+        if not pick_spk and gender_tl:
+            pick_spk = _tl5_nearest_seg(gender_tl, orig_st_ms, orig_en_ms, radius_near_ms)
+
+        voice_start_ms = orig_st_ms
+        if pick_spk:
+            voice_start_ms = int(pick_spk["start_ms"])
+
+        # Hitung lateness: seberapa telat subtitle dibanding suara.
+        # Kalau positif besar -> subtitle telat.
+        lateness_ms = orig_st_ms - voice_start_ms
+
+        # Target awal:
+        # - kita cuma MAJUIN subtitle (start jadi lebih awal),
+        # - jangan pernah sengaja menunda (kecuali bentrok prev baris).
+        # - tapi batasi max maju radius_ms.
+        if lateness_ms >= snap_ms:
+            # pilih yg lebih awal antara aslinya dan voice
+            candidate_ms = min(orig_st_ms, voice_start_ms)
         else:
-            seg_pick = _nearest_seg(segs, st_s, en_s, max_radius_s=radius_ms/1000.0)
-            if seg_pick:
-                used_near = True
-                stats_used_nearest += 1
+            # telatnya kecil -> jangan gerak
+            candidate_ms = orig_st_ms
 
-        # step 1: hitung start yang ideal BERDASARKAN SUARA
-        # voice_start_ms = kapan segmen suara mulai bicara
-        # delta = voice_start_ms - orig_start
-        # kalau delta < 0 artinya suara mulai duluan -> subtitle telat -> kita harus majukan start
-        # kalau delta > 0 artinya subtitle malah lebih cepat -> JANGAN ditunda, biarin
-        if seg_pick:
-            voice_start_ms = int(round(float(seg_pick["start_s"]) * 1000.0))
-            delta_start_ms = voice_start_ms - orig_start
-        else:
-            voice_start_ms = None
-            delta_start_ms = None
+        # batasi seberapa jauh kita boleh majuin
+        min_allowed_ms = orig_st_ms - radius_ms
+        tgt_st_ms = candidate_ms
+        if tgt_st_ms < min_allowed_ms:
+            tgt_st_ms = min_allowed_ms
 
-        # default: tidak geser
-        new_start = orig_start
-        new_end   = orig_end  # END DIKUNCI
+        # durasi minimal jaga end
+        if tgt_st_ms > (orig_en_ms - min_dur_ms):
+            tgt_st_ms = orig_en_ms - min_dur_ms
+        if tgt_st_ms < 0:
+            tgt_st_ms = 0
 
-        # kita cuma geser kalau:
-        # - kita punya kandidat segmen suara
-        # - delta_start_ms NEGATIF (artinya subtitle telat, perlu dimajuin)
-        # - selisihnya cukup besar (>= snap_ms) ATAU only_warned=False
-        if seg_pick and delta_start_ms is not None:
-            # delta_start_ms < 0 berarti suara mulai LEBIH AWAL daripada teks (teks telat)
-            if delta_start_ms < 0:
-                # kita cuma majukan start, jadi shift_advance adalah nilai negatif
-                shift_advance = delta_start_ms  # contoh: -600 ms
-                if only_warned and abs(shift_advance) < snap_ms:
-                    # telatnya kecil, jangan otak-atik
-                    shift_advance = 0
-                # jangan pernah bikin subtitle lebih lambat dari aslinya
-                # jadi kalau shift_advance > 0 (artinya mau bikin makin telat) -> nolkan
-                if shift_advance > 0:
-                    shift_advance = 0
+        # jangan numpuk baris sebelumnya
+        if prev_final_end_ms is not None:
+            min_gap_start = prev_final_end_ms + min_gap_ms
+            if tgt_st_ms < min_gap_start:
+                # ini technically bikin baris bisa "sedikit lebih lambat"
+                # dari orig_st_ms kalau prev_end terlalu mepet.
+                # Ini satu-satunya situasi di mana kita izinkan delay demi safety.
+                if min_gap_start < (orig_en_ms - min_dur_ms):
+                    tgt_st_ms = min_gap_start
+                else:
+                    # kalau gak muat, ya sudahlah: paksa tepat sebelum end
+                    tgt_st_ms = orig_en_ms - min_dur_ms
+                if tgt_st_ms < 0:
+                    tgt_st_ms = 0
 
-                candidate_start = orig_start + shift_advance  # ini <= orig_start (lebih awal atau sama)
+        # ==========================
+        # SPEAKER & GENDER BARU
+        # ==========================
+        spk_val = ""
+        gen_val = "unknown"
 
-                # jangan sampai overlap dengan baris sebelumnya:
-                if out_rows:
-                    prev_end_fixed = out_rows[-1]["end_ms"]  # END baris sebelumnya sudah fix
-                    if candidate_start < prev_end_fixed:
-                        candidate_start = prev_end_fixed
+        if pick_spk:
+            spk_val = (
+                pick_spk.get("speaker")
+                or pick_spk.get("speaker_local")
+                or ""
+            )
+            gen_val = (
+                pick_spk.get("gender")
+                or "unknown"
+            ).lower()
 
-                # jangan sampai start melewati END baris sendiri
-                if candidate_start > orig_end - min_dur_ms:
-                    candidate_start = max(orig_end - min_dur_ms, 0)
+        # fallback kalau gender dari speaker_tl gak ada/unknown:
+        if gen_val in ("", "unknown"):
+            pick_gender = _tl5_best_overlap(gender_tl, tgt_st_ms, orig_en_ms)
+            if not pick_gender:
+                pick_gender = _tl5_nearest_seg(gender_tl, tgt_st_ms, orig_en_ms, radius_near_ms)
+            if pick_gender:
+                gen_val = (pick_gender.get("gender") or "unknown").lower()
 
-                new_start = candidate_start
-                new_end   = orig_end  # end tetap
+        if not gen_val:
+            gen_val = "unknown"
 
-        # track statistik
-        if new_start != orig_start:
-            stats_changed_time += 1
-        else:
-            stats_relabel_only += 1
+        # buat final map
+        final_by_index[idx] = {
+            "start_ms": int(round(tgt_st_ms)),
+            "end_ms":   orig_en_ms,  # END LOCKED
+            "speaker":  spk_val,
+            "gender":   gen_val,
+        }
 
-        if not seg_pick:
-            stats_no_candidate += 1
+        # track buat clamp baris berikutnya
+        prev_final_end_ms = orig_en_ms
 
-        # assign speaker & gender untuk interval FINAL [new_start, new_end]
-        st2_s = new_start / 1000.0
-        en2_s = new_end   / 1000.0
+        # deteksi apakah baris ini berubah -> statistik
+        if (int(round(tgt_st_ms)) != orig_st_ms) or \
+           (str(r.get("speaker","")) != spk_val) or \
+           (str(r.get("gender","")).lower() != gen_val):
+            rows_changed_total += 1
 
-        seg_pick2 = _best_overlap(segs, st2_s, en2_s)
-        if not seg_pick2:
-            seg_pick2 = _nearest_seg(segs, st2_s, en2_s, max_radius_s=radius_ms/1000.0)
-
-        if seg_pick2:
-            speaker_val = (seg_pick2.get("speaker") or "").strip()
-            gender_val  = (seg_pick2.get("gender") or "unknown").lower()
-        else:
-            # fallback pakai nilai lama kalau ga nemu kandidat
-            speaker_val = (r.get("speaker") or "").strip()
-            gender_val  = (r.get("gender") or "unknown").lower()
-
-        # stabilkan gender lewat speaker map global
-        if (not gender_val or gender_val == "unknown") and speaker_val in spk_gender_map:
-            gender_val = spk_gender_map[speaker_val]
-
-        out_rows.append({
-            "index":   r["index"],
-            "start_ms": new_start,
-            "end_ms":   new_end,
-            "speaker":  speaker_val,
-            "gender":   gender_val,
-        })
-
-    # 4. tulis balik KE editing_cache.json SAJA
-    ec = ws / "editing_cache.json"
-    cache_obj = json.loads(ec.read_text(encoding="utf-8", errors="ignore"))
-    cache_rows = cache_obj.get("rows") if isinstance(cache_obj, dict) else None
-    if not isinstance(cache_rows, list):
+    # ====== 5) PATCH editing_cache.json ======
+    ec_path = ws / "editing_cache.json"
+    obj = _load_json_safely(ec_path) or {}
+    arr = obj.get("rows") if isinstance(obj, dict) else None
+    if not isinstance(arr, list):
         raise HTTPException(400, "Format editing_cache.json tidak dikenali")
 
-    # index -> hasil baru
-    final_by_index = {row["index"]: row for row in out_rows}
-
-    rows_changed_total = 0
-    for rec in cache_rows:
+    for rec in arr:
         try:
-            ridx = int(rec.get("index"))
+            idx = int(rec.get("index"))
         except Exception:
             continue
-        upd = final_by_index.get(ridx)
+
+        upd = final_by_index.get(idx)
         if not upd:
             continue
 
-        # START berubah? ya tulis string barunya
+        # UPDATE START SAJA (END JANGAN diutak-atik)
         rec["start"] = _ms_to_ts(upd["start_ms"])
-        # END TETAP sama seperti sebelumnya,
-        # JANGAN ganti rec["end"] pakai ms_to_ts(upd["end_ms"]) kalau itu beda.
-        # Jadi kita TIDAK menyentuh .end kecuali darurat durasi <80ms
-        # Cek apakah end_ms harus dipanjangin darurat
-        safe_end_ms = max(upd["end_ms"], upd["start_ms"] + min_dur_ms)
-        rec["end"] = _ms_to_ts(safe_end_ms)
 
-        # eff_* di cache adalah tampilan raw ms untuk pemrosesan lanjutan.
+        # ms eff_start_ms kalau ada
         if "eff_start_ms" in rec:
             rec["eff_start_ms"] = upd["start_ms"]
-        if "eff_end_ms" in rec:
-            # kita tetap isi eff_end_ms sama end existing (safe_end_ms), tapi konsepnya masih "end fix"
-            rec["eff_end_ms"] = safe_end_ms
+        # eff_end_ms jangan diubah (tetap pakai end lama)
 
+        # speaker & gender per-baris disamakan dgn voice terbaru
         if "speaker" in rec:
             rec["speaker"] = upd["speaker"]
+        else:
+            rec["speaker"] = upd["speaker"]
+
         if "gender" in rec:
             rec["gender"]  = upd["gender"]
+        else:
+            rec["gender"]  = upd["gender"]
 
-        rows_changed_total += 1
+    # tulis balik cache
+    ec_path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    ec.write_text(json.dumps(cache_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    # ====== 6) SIMPAN META & RETURN ======
     meta = {
-        "rows_changed": rows_changed_total,
-        "snap_ms": snap_ms,
-        "radius_ms": radius_ms,
-        "only_warned": only_warned,
-        "stats": {
-            "changed_time": stats_changed_time,
-            "relabel_only": stats_relabel_only,
-            "no_candidate": stats_no_candidate,
-            "used_overlap": stats_used_overlap,
-            "used_nearest": stats_used_nearest,
+        "anchors": anchors,
+        "fit": {
+            "a": float(a),
+            "b_ms": int(round(b_ms)),
         },
-        "note": "Hanya START yang boleh berubah. END dianggap kunci & tidak digeser."
+        "rows_changed": rows_changed_total,
+        "stats": {
+            "used_overlap": used_overlap_ct,
+            "used_nearest": used_nearest_ct,
+        },
+        "note": "START-only; END locked; gender/speaker per-row diambil dari voice timeline.",
     }
 
-    (ws / "editing_auto_sync.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (ws / "editing_auto_sync.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
     return JSONResponse({"ok": True, **meta})
+

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -43,489 +43,361 @@ def _safe_speaker_key(seg):
             return k
     return None
 
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    num = float((a * b).sum())
+    den = float(np.linalg.norm(a)) * float(np.linalg.norm(b)) + 1e-8
+    return num / den
 
-def _gather_samples(segments, samples_per_spk=8, min_dur=1.0):
+def _gather_samples(spk_spans: Dict[str, List[Tuple[float, float]]], samples_per_spk: int = 3):
     """
-    Ambil potongan yang cukup panjang per speaker untuk bikin centroid embedding.
+    Ambil beberapa potongan berdurasi terpanjang per speaker (local).
+    spk_spans: { 'SPEAKER_00': [(start,end), ...], ... }
+    return: { spk: [(start,end), ... <= samples_per_spk] }
     """
     by = {}
-    for s in segments:
-        k = _safe_speaker_key(s)
-        if not k:
-            continue
-        sp = s[k]
-        st = _parse_time(s.get("start", 0))
-        en = _parse_time(s.get("end", st))
-        if en - st < min_dur:
-            continue
-        by.setdefault(sp, []).append((st, en, en - st))
-
-    for sp, lst in by.items():
-        lst.sort(key=lambda x: x[2], reverse=True)
-        by[sp] = [(a, b) for a, b, _ in lst[:samples_per_spk]]
-
+    for spk, spans in spk_spans.items():
+        lst = sorted(spans, key=lambda ab: (ab[1] - ab[0]), reverse=True)
+        by[spk] = lst[:samples_per_spk]
     return by
 
-
-def _cos(a, b):
-    return float((a * b).sum()) / (
-        float(np.linalg.norm(a)) * float(np.linalg.norm(b)) + 1e-8
-    )
-
-
-def _extract_embeddings_ecapa(wav16k_path, time_spans, device="auto"):
+def _extract_embeddings_ecapa(
+    wav16k_path: str,
+    spans: List[Tuple[float, float]],
+    device: str = "auto",
+):
     """
-    Ambil embedding speaker per potongan waktu.
-    Import torch / speechbrain berat dipindah ke sini supaya TIDAK dieksekusi saat startup server.
+    Ambil embedding speaker per potongan waktu suara pakai ECAPA (SpeechBrain).
+    Kita ambil beberapa potongan (start,end) detik, convert ke mono 16 kHz,
+    terus encode_batch() → embedding vektor. Lalu kita normalisasi.
+
+    Return:
+        np.ndarray shape [N, D]  (tiap baris = 1 potongan suara)
+        Kalau nggak ada apa-apa → array shape [0, 192]
     """
+
     import torch, torchaudio
     from huggingface_hub import snapshot_download
     from speechbrain.inference import EncoderClassifier  # heavy, lazy import
 
+    # pilih device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # download / cache model ECAPA ke folder kerja session
     local_dir = Path(wav16k_path).parent / ".sb_model_ecapa"
     try:
         snapshot_download(
             "speechbrain/spkrec-ecapa-voxceleb",
             local_dir=str(local_dir),
-            local_dir_use_symlinks=False,  # copy, bukan symlink
+            local_dir_use_symlinks=False,  # copy instead of symlink (lebih aman di Windows)
             token=False,
         )
     except Exception as e:
         print(f"[ECAPA] snapshot_download warn: {e}")
 
+    # load classifier ECAPA dari local cache
     classifier = EncoderClassifier.from_hparams(
         source=str(local_dir),
         run_opts={"device": device},
     )
 
+    # load audio 16 kHz mono
     wav, sr = torchaudio.load(str(wav16k_path))
     if sr != 16000:
         wav = torchaudio.functional.resample(wav, sr, 16000)
         sr = 16000
 
+    # wav shape sekarang [C, T]; kita mau [1, T] mono
+    if wav.dim() == 2 and wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    # pastikan [1, T]
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+
     embs = []
-    for (start, end) in time_spans:
-        s = max(0, int(start * sr))
-        e = min(wav.shape[1], int(end * sr))
-        x = (
-            torch.nn.functional.pad(wav[:, s:e], (0, max(0, sr - (e - s))))
-            if e - s < sr
-            else wav[:, s:e]
-        )
+
+    for (start_sec, end_sec) in spans:
+        # konversi detik → sample index
+        s_idx = max(0, int(start_sec * sr))
+        e_idx = min(wav.shape[1], int(end_sec * sr))
+        if e_idx <= s_idx:
+            continue
+
+        chunk = wav[:, s_idx:e_idx]  # [1, Tchunk]
+
+        # Pastikan potongan minimal panjang ~1 detik biar BN di ECAPA aman
+        if chunk.shape[1] < sr:
+            pad_needed = sr - chunk.shape[1]
+            # pad kanan
+            chunk = torch.nn.functional.pad(chunk, (0, pad_needed))
+
         with torch.no_grad():
-            v = classifier.encode_batch(x).squeeze().cpu().numpy()
-        v = v / (np.linalg.norm(v) + 1e-8)
-        embs.append(v.astype(np.float32))
+            vec = classifier.encode_batch(chunk.to(device))  # [1,1,D]
+        vec = vec.squeeze().cpu().numpy().astype(np.float32)
 
-    if embs:
-        return np.stack(embs, axis=0)
-    return np.zeros((0, 192), np.float32)
+        # L2-normalize supaya konsisten
+        norm = np.linalg.norm(vec) + 1e-8
+        vec = (vec / norm).astype(np.float32)
+
+        embs.append(vec)
+
+    if not embs:
+        # fallback kosong
+        return np.zeros((0, 192), dtype=np.float32)
+
+    return np.stack(embs, axis=0).astype(np.float32)
 
 
+# -----------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH: global speaker linking
+# -----------------------------------------------------------------------------
 def _global_link_speakers(
-    seg_path: Path,
-    spk_path: Path,
+    raw_path: Path,
     wav16k_path: Path,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
+    *,
     link_threshold: float = 0.93,
     samples_per_spk: int = 8,
-    min_sample_dur: float = 1.5,
+    min_sample_dur: float = 1.0,   # boleh dipakai kalau mau filter span terlalu pendek
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
     device: str = "auto",
-) -> Tuple[dict, dict]:
+):
     """
-    1. Ambil hasil diarization mentah (SPEAKER_00, SPEAKER_01, ...).
-    2. Buat cluster global konsisten (SPK_01, SPK_02, ...),
-       dengan gender guard (male != female tidak boleh digabung).
-    3. Masukkan semua speaker lokal (termasuk yang durasi pendek, yang tadinya
-       gak punya centroid) supaya gak ada sisa SPEAKER_00 di editor.
-    4. Paksa jumlah speaker global <= max_speakers (kalau di-set),
-       sambil tetap hormati gender guard.
-    5. Setelah selesai merge, kita rename ulang SPK_xx supaya rapi
-       dan apply mapping ini ke semua segmen.
+    Baca <stem>_speaker_timeline_raw.json, ambil embedding ECAPA per speaker lokal,
+    cluster speaker lokal jadi speaker global (SPK_01, SPK_02, ...).
+
+    Kemudian enforce max_speakers:
+    - urutkan cluster berdasarkan total durasi bicara,
+    - keep top-N,
+    - sisanya merge ke cluster terdekat (cosine highest).
+
+    Return:
+      linked_obj = {
+         "segments": [
+            {"start_s": float, "end_s": float, "speaker": "SPK_01"},
+            ...
+         ],
+         "duration": <float>
+      }
+      debug_map = {
+         "local2global": {"SPEAKER_00": "SPK_01", ...},
+         "cluster_dur": {...},
+         "grouped_locals": {...}  # speaker lokal per cluster
+      }
     """
 
-    # --- load json awal ---
-    with open(seg_path, "r", encoding="utf-8") as f:
-        seg = json.load(f)
-    with open(spk_path, "r", encoding="utf-8") as f:
-        spk = json.load(f)
+    import numpy as np
+    from collections import defaultdict
 
-    segments = seg.get("segments") if isinstance(seg, dict) else seg
-    if not isinstance(segments, list):
-        raise ValueError("segments json must be a list or have 'segments' list")
+    # --- 1. load timeline mentah
+    raw_json = json.loads(raw_path.read_text(encoding="utf-8"))
+    segs_raw = raw_json.get("segments", [])
+    total_dur = float(raw_json.get("duration", 0.0) or 0.0)
 
-    # --- helper buat ambil tabel speaker -> gender dari output dracin_gender ---
-    def _norm_spk_tbl(spk_obj):
-        # nyamain struktur spk agar jadi dict {local_spk_id: {...info...}}
-        if isinstance(spk_obj, dict) and "speakers" in spk_obj:
-            tbl = spk_obj["speakers"]
+    # Helper buat ambil nama speaker lokal di seg lama
+    def _get_local_spk(seg):
+        key = _safe_speaker_key(seg)
+        return seg.get(key, "") if key else ""
+
+    # Kumpulin semua span per speaker lokal
+    spans_by_spk = defaultdict(list)  # { "SPEAKER_00": [(s,e), ...] }
+    for seg in segs_raw:
+        s0 = float(seg.get("start") or seg.get("start_s") or 0.0)
+        s1 = float(seg.get("end")   or seg.get("end_s")   or 0.0)
+        if s1 <= s0:
+            continue
+        sp_local = _get_local_spk(seg)
+        if not sp_local:
+            continue
+        # bisa skip segmen super pendek kalau mau pakai min_sample_dur
+        if (s1 - s0) < float(min_sample_dur or 0.0):
+            continue
+        spans_by_spk[sp_local].append((s0, s1))
+
+    # Ambil beberapa potongan terpanjang per speaker lokal
+    sample_spans = _gather_samples(spans_by_spk, samples_per_spk)
+
+    # Ekstrak embedding ECAPA utk setiap speaker lokal
+    emb_avg_by_local = {}
+    for sp_local, spans in sample_spans.items():
+        emb_mat = _extract_embeddings_ecapa(str(wav16k_path), spans, device=device)
+        if emb_mat.shape[0] > 0:
+            emb_avg_by_local[sp_local] = emb_mat.mean(axis=0).astype(np.float32)
+
+    locals_list = list(emb_avg_by_local.keys())
+    if not locals_list:
+        # fallback trivial: kasih nama SPK_01 ke semua
+        linked_segments = []
+        for seg in segs_raw:
+            s0 = float(seg.get("start") or seg.get("start_s") or 0.0)
+            s1 = float(seg.get("end")   or seg.get("end_s")   or 0.0)
+            if s1 <= s0:
+                continue
+            sp_loc = _get_local_spk(seg) or "SPK_01"
+            linked_segments.append({
+                "start_s": s0,
+                "end_s": s1,
+                "speaker": "SPK_01" if sp_loc else "SPK_01",
+            })
+        return (
+            {"segments": linked_segments, "duration": total_dur},
+            {
+                "local2global": {sp: "SPK_01" for sp in spans_by_spk.keys()},
+                "cluster_dur": {},
+                "grouped_locals": {"SPK_01": locals_list},
+            }
+        )
+
+    # --- 2. Cluster local speakers pakai union-find + cosine sim threshold
+    parent = {sp: sp for sp in locals_list}
+
+    def uf_find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def uf_union(a, b):
+        ra = uf_find(a)
+        rb = uf_find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, a in enumerate(locals_list):
+        for j in range(i + 1, len(locals_list)):
+            b = locals_list[j]
+            sim = _cos(emb_avg_by_local[a], emb_avg_by_local[b])
+            if sim >= float(link_threshold):
+                uf_union(a, b)
+
+    # grouped_locals: root -> [local speakers...]
+    grouped_locals = defaultdict(list)
+    for sp in locals_list:
+        grouped_locals[uf_find(sp)].append(sp)
+
+    # centroid per cluster
+    cluster_centroid = {}
+    for root, members in grouped_locals.items():
+        vecs = [emb_avg_by_local[m] for m in members if m in emb_avg_by_local]
+        if not vecs:
+            continue
+        cluster_centroid[root] = np.mean(np.stack(vecs, axis=0), axis=0).astype(np.float32)
+
+    # durasi bicara per speaker lokal
+    dur_by_local = {}
+    for sp_local, lst in spans_by_spk.items():
+        tot = 0.0
+        for (s0, s1) in lst:
+            tot += max(0.0, s1 - s0)
+        dur_by_local[sp_local] = tot
+
+    # durasi bicara per cluster
+    cluster_dur = {}
+    for root, members in grouped_locals.items():
+        tot = 0.0
+        for m in members:
+            tot += dur_by_local.get(m, 0.0)
+        cluster_dur[root] = tot
+
+    # sort cluster by talk duration desc
+    clusters_sorted = sorted(cluster_dur.items(), key=lambda kv: kv[1], reverse=True)
+    cluster_roots_sorted = [c for (c, _dur) in clusters_sorted]
+
+    # --- 3. Enforce max_speakers
+    kept_roots = list(cluster_roots_sorted)
+    if max_speakers is not None and len(kept_roots) > max_speakers:
+        base_roots = kept_roots[:max_speakers]
+        extra_roots = kept_roots[max_speakers:]
+
+        # merge semua extra_roots ke base terdekat
+        for rc in extra_roots:
+            if rc not in cluster_centroid:
+                continue
+            # pilih base dg cosine tertinggi
+            best_base = max(
+                base_roots,
+                key=lambda br: _cos(cluster_centroid[rc], cluster_centroid[br])
+            )
+            # gabungkan member rc ke grouped_locals[best_base]
+            grouped_locals[best_base].extend(grouped_locals[rc])
+            cluster_dur[best_base] += cluster_dur[rc]
+
+        kept_roots = base_roots
+
+    # kasih nama SPK_01, SPK_02, ... hanya utk kept_roots
+    root2global = {}
+    for idx, root in enumerate(kept_roots, start=1):
+        root2global[root] = f"SPK_{idx:02d}"
+
+    # assign local2global
+    local2global = {}
+    for root, members in grouped_locals.items():
+        if root in root2global:
+            gname = root2global[root]
         else:
-            tbl = spk_obj
+            # cluster yg di-merge -> pilih base yg paling mirip centroidnya
+            if root in cluster_centroid and kept_roots:
+                best_base = max(
+                    kept_roots,
+                    key=lambda br: _cos(cluster_centroid[root], cluster_centroid[br])
+                )
+                gname = root2global[best_base]
+            else:
+                # fallback
+                gname = "SPK_99"
+        for m in members:
+            local2global[m] = gname
 
-        if isinstance(tbl, list):
-            out = {}
-            for it in tbl:
-                spid = it.get("id") or it.get("label") or it.get("name")
-                if spid:
-                    out[spid] = {
-                        k: v
-                        for k, v in it.items()
-                        if k not in ("id", "label", "name")
-                    }
-            return out
-        elif isinstance(tbl, dict):
-            return tbl
-        return {}
+    # --- 4. rewrite timeline segmen ke speaker global
+    linked_segments = []
+    for seg in segs_raw:
+        s0 = float(seg.get("start") or seg.get("start_s") or 0.0)
+        s1 = float(seg.get("end")   or seg.get("end_s")   or 0.0)
+        if s1 <= s0:
+            continue
+        sp_local = _get_local_spk(seg)
+        sp_global = local2global.get(sp_local, sp_local or "SPK_00")
+        linked_segments.append({
+            "start_s": s0,
+            "end_s": s1,
+            "speaker": sp_global,
+        })
 
-    spk_tbl = _norm_spk_tbl(spk)
+    linked_obj = {
+        "segments": linked_segments,
+        "duration": total_dur,
+    }
 
-    # Ambil sampel durasi panjang per speaker lokal
-    samples = _gather_samples(
-        segments,
+    debug_map = {
+        "local2global": local2global,
+        "cluster_dur": cluster_dur,
+        "grouped_locals": dict(grouped_locals),
+    }
+
+    return linked_obj, debug_map
+
+
+# Backward-compat alias (biar kode lama yg masih manggil nama lama gak meledak):
+def _global_link_speakers_from_raw(
+    raw_path: Path,
+    wav16k_path: Path,
+    link_threshold: float = 0.93,
+    samples_per_spk: int = 8,
+    min_sample_dur: float = 1.0,
+    device: str = "auto",
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+):
+    return _global_link_speakers(
+        raw_path,
+        wav16k_path,
+        link_threshold=link_threshold,
         samples_per_spk=samples_per_spk,
-        min_dur=min_sample_dur,
+        min_sample_dur=min_sample_dur,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        device=device,
     )
-    local_spks = list(samples.keys())
-    if not local_spks:
-        # tidak ada sample cukup panjang -> balikkan apa adanya
-        return seg, spk
-
-    # Hitung centroid embedding per speaker lokal (pakai ECAPA)
-    centroids = {}
-    dur_by = {}
-    for sp_local in local_spks:
-        e = _extract_embeddings_ecapa(wav16k_path, samples[sp_local], device=device)
-        if e.shape[0] == 0:
-            continue
-        c = e.mean(axis=0)
-        c = c / (np.linalg.norm(c) + 1e-8)
-        centroids[sp_local] = c
-        dur_by[sp_local] = sum(b - a for a, b in samples[sp_local])
-
-    # struktur cluster global awal
-    global_ids = []      # ["SPK_01", "SPK_02", ...] (sementara)
-    global_vecs = []     # centroid gabungan untuk tiap cluster (np.array atau None)
-    global_wgts = []     # total durasi gabungan (float)
-    cluster_gender = []  # gender cluster saat ini ("male"/"female"/"unknown")
-    mapping = {}         # speaker lokal -> cluster-id sementara ("SPK_01", ...)
-
-    # urutkan speaker lokal dari durasi terpanjang, biar anchor kuat dulu
-    for sp_local in sorted(local_spks, key=lambda x: dur_by.get(x, 0), reverse=True):
-        v = centroids.get(sp_local)
-
-        # gender lokal hasil klasifikasi hf_svm / reference
-        g_local = (spk_tbl.get(sp_local, {}).get("gender") or "unknown").lower()
-        if g_local not in ("male", "female", "unknown"):
-            g_local = "unknown"
-
-        # kalau speaker ini gak punya centroid (aneh tapi mungkin)
-        if v is None:
-            gid = f"SPK_{len(global_ids)+1:02d}"
-            global_ids.append(gid)
-            global_vecs.append(None)
-            global_wgts.append(float(dur_by.get(sp_local, 0.0)))
-            cluster_gender.append(g_local)
-            mapping[sp_local] = gid
-            continue
-
-        # cari cluster global yg paling mirip (pakai cosine sim)
-        best_i, best_sim = None, -1.0
-        for i, gvec in enumerate(global_vecs):
-            if gvec is None:
-                continue
-
-            # --- GENDER GUARD ---
-            g_cluster = cluster_gender[i] or "unknown"
-            if (
-                g_local in ("male", "female")
-                and g_cluster in ("male", "female")
-                and g_local != g_cluster
-            ):
-                # cowok != cewek => skip
-                continue
-
-            s = _cos(v, gvec)
-            if s > best_sim:
-                best_sim = s
-                best_i = i
-
-        # cukup mirip -> merge ke cluster yg sudah ada
-        if best_i is not None and best_sim >= link_threshold:
-            gvec = global_vecs[best_i]
-            w_old = float(global_wgts[best_i])
-            w_new = float(dur_by.get(sp_local, 0.0))
-
-            new_vec = (gvec * (w_old + 1e-8) + v * (w_new + 1e-8))
-            new_vec = new_vec / (np.linalg.norm(new_vec) + 1e-8)
-
-            global_vecs[best_i] = new_vec
-            global_wgts[best_i] = w_old + w_new
-
-            # jangan overwrite gender yg sudah "male"/"female"
-            if cluster_gender[best_i] in ("unknown", None, "") and g_local in ("male", "female"):
-                cluster_gender[best_i] = g_local
-
-            mapping[sp_local] = global_ids[best_i]
-
-        else:
-            # bikin cluster baru
-            gid = f"SPK_{len(global_ids)+1:02d}"
-            global_ids.append(gid)
-            global_vecs.append(v)
-            global_wgts.append(float(dur_by.get(sp_local, 0.0)))
-            cluster_gender.append(g_local)
-            mapping[sp_local] = gid
-
-    # ===================================================================
-    # STEP A: pastikan SEMUA label speaker mentah di segmen punya mapping
-    # ===================================================================
-
-    seg_key = _safe_speaker_key(segments[0]) or "speaker"
-
-    # kumpulkan semua label yg ada di segments
-    all_labels = set()
-    for s in segments:
-        raw = s.get(seg_key)
-        if isinstance(raw, list):
-            for r in raw:
-                all_labels.add(r)
-        elif isinstance(raw, str):
-            all_labels.add(raw)
-
-    # tambahkan label yg belum tercover (misal durasi pendek bgt)
-    for sp_local in sorted(all_labels):
-        if sp_local in mapping:
-            continue
-
-        g_local = (spk_tbl.get(sp_local, {}).get("gender") or "unknown").lower()
-        if g_local not in ("male", "female", "unknown"):
-            g_local = "unknown"
-
-        gid = f"SPK_{len(global_ids)+1:02d}"
-        global_ids.append(gid)
-        global_vecs.append(None)
-        global_wgts.append(0.0)
-        cluster_gender.append(g_local)
-
-        mapping[sp_local] = gid
-
-    # ===================================================================
-    # STEP B: enforce max_speakers (penggabungan paksa)
-    # ===================================================================
-    # Kita merge cluster sampai jumlahnya <= max_speakers,
-    # sambil hormati gender guard. Cluster dengan durasi kecil
-    # akan "nyangkut" ke cluster durasi besar yg paling mirip.
-    # NOTE:
-    # - Kita kerja di level cluster (global_ids[*])
-    # - mapping[local_spk] harus ikut di-update setiap kali merge
-    # - Setelah selesai, nanti kita re-label jadi SPK_01, SPK_02, ...
-    # ===================================================================
-
-    # siapkan struktur "cluster_locals": daftar speaker lokal yg nempel ke tiap cluster
-    cluster_locals = [[] for _ in global_ids]
-    for loc, gid in mapping.items():
-        # cari index cluster untuk gid ini
-        # (global_ids is unique per cluster-id at this stage)
-        for idx, kk in enumerate(global_ids):
-            if kk == gid:
-                cluster_locals[idx].append(loc)
-                break
-
-    # fungsi untuk cek gender compatible
-    def _can_merge_gender(g_a: str, g_b: str) -> bool:
-        g_a = (g_a or "unknown").lower()
-        g_b = (g_b or "unknown").lower()
-        if (g_a in ("male","female")) and (g_b in ("male","female")) and (g_a != g_b):
-            return False
-        return True  # unknown boleh gabung kemana aja, male+male oke, female+female oke
-
-    # target count speaker global
-    target_count = None
-    if max_speakers is not None:
-        # jangan merge sampai di bawah min_speakers (kalau ada)
-        if min_speakers is not None:
-            target_count = max(int(max_speakers), int(min_speakers))
-        else:
-            target_count = int(max_speakers)
-
-    if target_count is not None:
-        while True:
-            # cari cluster aktif sekarang
-            active_idxs = [i for i, gid in enumerate(global_ids) if gid is not None]
-            if len(active_idxs) <= target_count:
-                break  # cukup sedikit
-
-            # cari pasangan cluster yang paling cocok untuk digabung
-            # Preferensi:
-            #   1. dua cluster yg punya embedding -> ambil cos sim tertinggi
-            #   2. kalau ga ada pasangan yg sama2 punya embedding,
-            #      gabungkan dua cluster compatible gender dengan durasi total terkecil
-            pairs_with_sim = []
-            pairs_wo_sim = []
-
-            for ai in range(len(active_idxs)):
-                for bi in range(ai + 1, len(active_idxs)):
-                    i_idx = active_idxs[ai]
-                    j_idx = active_idxs[bi]
-
-                    ga = cluster_gender[i_idx]
-                    gb = cluster_gender[j_idx]
-                    if not _can_merge_gender(ga, gb):
-                        continue  # jangan merge male<>female
-
-                    vi = global_vecs[i_idx]
-                    vj = global_vecs[j_idx]
-                    wi = float(global_wgts[i_idx])
-                    wj = float(global_wgts[j_idx])
-
-                    if vi is not None and vj is not None:
-                        sim = _cos(vi, vj)
-                        pairs_with_sim.append((sim, i_idx, j_idx))
-                    else:
-                        # fallback pair tanpa sim: pake total durasi kecil
-                        pairs_wo_sim.append((wi + wj, i_idx, j_idx))
-
-            if pairs_with_sim:
-                # ambil pair dengan similarity tertinggi
-                pairs_with_sim.sort(key=lambda x: x[0], reverse=True)
-                _, i_idx, j_idx = pairs_with_sim[0]
-            elif pairs_wo_sim:
-                # ambil pair dengan total durasi terkecil
-                pairs_wo_sim.sort(key=lambda x: x[0])
-                _, i_idx, j_idx = pairs_wo_sim[0]
-            else:
-                # tidak ada pasangan merge yg gender-compatible -> stop
-                break
-
-            # tentukan anchor cluster mana yg "utama"
-            wi = float(global_wgts[i_idx])
-            wj = float(global_wgts[j_idx])
-            if wi >= wj:
-                main_idx, other_idx = i_idx, j_idx
-            else:
-                main_idx, other_idx = j_idx, i_idx
-
-            # merge centroid
-            v_main = global_vecs[main_idx]
-            v_other = global_vecs[other_idx]
-            w_main = float(global_wgts[main_idx])
-            w_other = float(global_wgts[other_idx])
-
-            if v_main is None and v_other is not None:
-                new_vec = v_other
-            elif v_other is None and v_main is not None:
-                new_vec = v_main
-            elif v_main is None and v_other is None:
-                new_vec = None
-            else:
-                tmp = (v_main * (w_main + 1e-8) + v_other * (w_other + 1e-8))
-                tmp = tmp / (np.linalg.norm(tmp) + 1e-8)
-                new_vec = tmp
-
-            global_vecs[main_idx] = new_vec
-            global_wgts[main_idx] = w_main + w_other
-
-            # merge gender cluster:
-            g_main = (cluster_gender[main_idx] or "unknown").lower()
-            g_oth  = (cluster_gender[other_idx] or "unknown").lower()
-            if g_main in ("male","female"):
-                final_g = g_main
-            elif g_oth in ("male","female"):
-                final_g = g_oth
-            else:
-                final_g = g_main  # keduanya unknown -> tetap unknown
-
-            cluster_gender[main_idx] = final_g
-
-            # update mapping semua local speaker di other_idx -> main_idx
-            keep_gid   = global_ids[main_idx]
-            losing_gid = global_ids[other_idx]
-
-            for loc_id in cluster_locals[other_idx]:
-                mapping[loc_id] = keep_gid
-            cluster_locals[main_idx].extend(cluster_locals[other_idx])
-            cluster_locals[other_idx] = []
-
-            # matikan cluster other_idx
-            global_ids[other_idx] = None
-            global_vecs[other_idx] = None
-            global_wgts[other_idx] = 0.0
-            cluster_gender[other_idx] = "unknown"
-
-        # selesai while merge
-
-    # ===================================================================
-    # STEP C: relabel final cluster -> SPK_01, SPK_02, ... (urutan durasi besar dulu)
-    # ===================================================================
-
-    active_idxs = [i for i, gid in enumerate(global_ids) if gid is not None]
-    # sort by durasi desc supaya SPK_01 = speaker dominan
-    active_idxs.sort(key=lambda i: float(global_wgts[i]), reverse=True)
-
-    old_to_new = {}
-    cluster_gender_map = {}  # new_gid -> gender "male"/"female"/"unknown"
-    for rank, idx in enumerate(active_idxs, start=1):
-        old_gid = global_ids[idx]
-        new_gid = f"SPK_{rank:02d}"
-        old_to_new[old_gid] = new_gid
-        cluster_gender_map[new_gid] = (cluster_gender[idx] or "unknown")
-
-    # update mapping lokal speaker -> pakai nama baru
-    for loc, gid in list(mapping.items()):
-        new_gid = old_to_new.get(gid, gid)
-        mapping[loc] = new_gid
-
-    # ===================================================================
-    # STEP D: terapkan mapping final ke semua segmen
-    # ===================================================================
-
-    for s in segments:
-        sp_val = s.get(seg_key)
-        if isinstance(sp_val, list):
-            s[seg_key] = [mapping.get(x, x) for x in sp_val]
-        elif isinstance(sp_val, str):
-            s[seg_key] = mapping.get(sp_val, sp_val)
-
-    # ===================================================================
-    # STEP E: bangun speakers final untuk ditulis ke *_speakers_linked.json
-    # ===================================================================
-
-    # group semua lokal-id yg sekarang jadi 1 global speaker
-    by_global = {}
-    for loc, gid in mapping.items():
-        by_global.setdefault(gid, []).append(loc)
-
-    merged_out = {}
-    for gid, locals_ in by_global.items():
-        info = {}
-
-        # ambil info paling informatif dari salah satu anggota lokal (gender/age/notes/...)
-        for k in ("gender", "voice", "notes", "age", "accent"):
-            for x in locals_:
-                val = spk_tbl.get(x, {}).get(k)
-                if val not in (None, "", "unknown"):
-                    info[k] = val
-                    break
-
-        # fallback gender kalau belum ada
-        if "gender" not in info or info["gender"] in (None, "", "unknown"):
-            info["gender"] = cluster_gender_map.get(gid, "unknown")
-
-        merged_out[gid] = info
-
-    # return struktur final:
-    # segments: { "segments":[ {start, end, speaker:"SPK_01", gender:"male"?}, ... ] }
-    # speakers: { "speakers": { "SPK_01": {"gender":"male"}, ... } }
-
-    return {"segments": segments}, {"speakers": merged_out}
-
-
-
-
 
 # ----------------- ProcessingManager -----------------
 
@@ -743,87 +615,117 @@ class ProcessingManager:
 
     async def run_diarization(self, session_id: str, cfg: dict):
         """
-        Jalankan DiarizationEngine(), lalu lakukan global speaker linking
-        (SPK_01, SPK_02, ...) supaya ID speaker konsisten sepanjang video.
+        Jalankan DiarizationEngine() -> hasilkan:
+          - <stem>_speaker_timeline_raw.json
+          - <stem>_gender_timeline.json
+
+        Lalu (opsional link_global):
+          - bikin <stem>_speaker_timeline_linked.json
+            dengan ID global SPK_01, SPK_02, ... yang stabil di seluruh video.
+
+        Kita TIDAK lagi pakai *_gender_segments.json / *_gender_speakers.json.
         """
+
+        # 1. pastikan engine diarization sudah kebuka
         self._ensure_engines()
 
+        # 2. ambil session + cek audio 16k
         session = self.get_session(session_id)
         if not session:
             raise ValueError("Session not found")
         if not getattr(session, "wav_16k", None):
             raise ValueError("16kHz audio not found. Run extract-audio first")
 
+        # 3. jalankan DiarizationEngine.process()
+        # engine.process() sekarang harus balikin:
+        #   {
+        #     "success": True,
+        #     "data": {
+        #        "speaker_timeline_raw": "<path/..._speaker_timeline_raw.json>",
+        #        "gender_timeline":      "<path/..._gender_timeline.json>"
+        #     }
+        #   }
         engine = self._diarization_engine
         result = await engine.process(session, cfg, lambda *a, **k: None)
+
         if not isinstance(result, dict):
             raise RuntimeError(f"Engine returned invalid result: {result!r}")
         if not result.get("success"):
             raise RuntimeError(result.get("error", "Diarization failed"))
 
         data = result["data"]
-        seg_path = Path(data["segjson"])
-        spk_path = Path(data["spkjson"])
-        srt_path = Path(data["srt"]) if data.get("srt") else None
 
-        cfg = cfg or {}
-        if bool(cfg.get("link_global", True)):
-            try:
-                linked_seg, linked_spk = _global_link_speakers(
-                    seg_path,
-                    spk_path,
-                    Path(session.wav_16k),
-                    min_speakers=cfg.get("min_speakers"),
-                    max_speakers=cfg.get("max_speakers"),
-                    link_threshold=float(cfg.get("link_threshold", 0.93)),
-                    samples_per_spk=int(cfg.get("samples_per_spk", 8)),
-                    min_sample_dur=float(cfg.get("min_sample_dur", 1.0)),
-                    device="auto",
-                )
+        raw_path_str    = data.get("speaker_timeline_raw")
+        gender_path_str = data.get("gender_timeline")
 
-                seg_link = seg_path.with_name(seg_path.stem + "_linked.json")
-                spk_link = spk_path.with_name(spk_path.stem + "_linked.json")
-                seg_link.write_text(
-                    json.dumps(linked_seg, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                spk_link.write_text(
-                    json.dumps(linked_spk, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+        if not raw_path_str or not gender_path_str:
+            raise RuntimeError("Diarization result missing timeline paths")
 
-                # kompat ke nama lama (_segments.json / _speakers.json)
-                seg_compat = seg_link.with_name(
-                    seg_link.name.replace(
-                        "_segments_linked.json", "_segments.json"
-                    )
-                )
-                spk_compat = spk_link.with_name(
-                    spk_link.name.replace(
-                        "_speakers_linked.json", "_speakers.json"
-                    )
-                )
-                shutil.copyfile(seg_link, seg_compat)
-                shutil.copyfile(spk_link, spk_compat)
-                print(
-                    "[GlobalLink] compat copies ->",
-                    seg_compat.name,
-                    spk_compat.name,
-                )
-                seg_path, spk_path = seg_link, spk_link
-                print(
-                    "[GlobalLink] done ->",
-                    seg_link.name,
-                    spk_link.name,
-                )
-            except Exception as e:
-                print(f"[GlobalLink] skipped: {e}")
+        raw_path    = Path(raw_path_str).resolve()
+        gender_path = Path(gender_path_str).resolve()
 
+        if not raw_path.exists():
+            raise RuntimeError("speaker_timeline_raw.json not found on disk")
+        if not gender_path.exists():
+            raise RuntimeError("gender_timeline.json not found on disk")
+
+        # 4. Tentukan path linked (ID global SPK_01, SPK_02, ...)
+        # setelah dapet raw_path, gender_path
+        linked_path = raw_path.with_name(
+            raw_path.name.replace("_speaker_timeline_raw", "_speaker_timeline_linked")
+        )
+
+        if str(cfg.get("link_global", "true")).lower() == "true":
+            linked_obj, debug_map = _global_link_speakers(
+                raw_path,
+                Path(session.wav_16k),
+                link_threshold=float(cfg.get("link_threshold", 0.93)),
+                samples_per_spk=int(cfg.get("samples_per_spk", 8)),
+                min_sample_dur=float(cfg.get("min_sample_dur", 1.0)),
+                min_speakers=cfg.get("min_speakers"),
+                max_speakers=cfg.get("max_speakers"),
+                device=("cuda" if cfg.get("use_gpu") else "cpu"),
+            )
+
+            # tulis linked timeline
+            linked_path.write_text(
+                json.dumps(linked_obj, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+
+            # optional: mapping debug
+            debug_map_path = linked_path.with_name(
+                linked_path.name.replace(
+                    "_speaker_timeline_linked",
+                    "_speaker_timeline_linked_mapping"
+                )
+            )
+            debug_map_path.write_text(
+                json.dumps(debug_map, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        else:
+            # kalau user matiin link_global -> anggap "linked" = raw
+            linked_path = raw_path
+
+        # lalu update session metadata (ini udah ada di kode kamu)
         self.session_manager.update_session(
             session_id,
-            segjson=seg_path,
-            spkjson=spk_path,
-            srtpath=srt_path,
+            status="diar_done",
+            progress=80,
+            current_step="Diarization done",
+            speaker_timeline_raw=str(raw_path),
+            speaker_timeline_linked=str(linked_path),
+            gender_timeline=str(gender_path),
+        )
+
+
+        # 5. update status session biar UI tau path2 terbaru
+        self.session_manager.update_session(
+            session_id,
+            speaker_timeline_raw=str(raw_path),
+            speaker_timeline_linked=str(linked_path),
+            gender_timeline=str(gender_path),
             status="diarization_complete",
             progress=100,
             current_step="Diarization done",
@@ -831,11 +733,13 @@ class ProcessingManager:
 
         await self._notify_session_update(session_id)
 
+        # 6. return buat endpoint /api/session/{id}/diarization
         return {
-            "segments_path": seg_path,
-            "speakers_path": spk_path,
-            "srt_path": srt_path,
+            "speaker_timeline_raw":      str(raw_path),
+            "speaker_timeline_linked":   str(linked_path),
+            "gender_timeline":           str(gender_path),
         }
+
 
     # ---- Export TTS (placeholder lama) ----
 

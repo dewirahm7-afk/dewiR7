@@ -197,29 +197,26 @@ class DiarizationEngine:
                     os.chdir(old_cwd)
                     sys.argv = argv_backup
 
-                # ── cari output terbaru lalu bawa ke root workdir ───────────────
-                seg = latest("*_gender_segments.json")
-                spk = latest("*_gender_speakers.json")
-                srt = latest("*_gender.srt")  # opsional
+                # ── cari output timeline baru dari dracin_gender ----------------
+                spk_raw = latest("*_speaker_timeline_raw.json")
+                gen_tl  = latest("*_gender_timeline.json")
 
-                if not seg or not spk:
+                if not spk_raw or not gen_tl:
                     return {
                         "success": False,
-                        "error": "gender_main selesai tapi tidak menghasilkan seg/spk json",
+                        "error": "dracin_gender selesai tapi file timeline tidak ketemu",
                     }
 
-                seg = bring_to_root(seg)
-                spk = bring_to_root(spk)
-                srt = bring_to_root(srt) if srt else None
+                spk_raw = bring_to_root(spk_raw)
+                gen_tl  = bring_to_root(gen_tl)
 
                 data = {
-                    "segjson": str(seg),
-                    "spkjson": str(spk),
+                    "speaker_timeline_raw": str(spk_raw),
+                    "gender_timeline": str(gen_tl),
                 }
-                if srt:
-                    data["srt"] = str(srt)
 
                 return {"success": True, "data": data}
+
 
             except BaseException as e:
                 return {
