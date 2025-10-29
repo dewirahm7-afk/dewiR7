@@ -278,13 +278,15 @@ class DracinApp {
 						<label class="block text-sm font-medium mb-2 text-gray-300">Gender Mode</label>
 						<select id="gender-mode"
 								class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white">
-							<option value="hf_svm" selected>Pretrained (HF SVM)</option>
-							<option value="reference">Reference Banks (Manual)</option>
+							<option value="hf_svm" selected>hf_svm (ECAPA+SVM, per segmen)</option>
+							<option value="wav2vec2">wav2vec2 (Wav2Vec2 age-gender, per segmen)</option>
+							<option value="reference">reference (Male/Female bank)</option>
 						</select>
 						<p class="text-xs text-gray-400 mt-1">
-							hf_svm = otomatis pakai model pretrained<br>
-							reference = pakai folder Male/Female kamu
+							hf_svm / wav2vec2 = otomatis deteksi gender per potongan suara<br>
+							reference = pakai bank suara contoh kamu sendiri
 						</p>
+
 					</div>
 
 					<!-- Top N Segments -->
@@ -330,9 +332,10 @@ class DracinApp {
 					<!-- HF Token -->
 					<div class="md:col-span-2">
 						<label class="block text-sm font-medium mb-2 text-gray-300">HF Token</label>
-						<input id="hf-token" type="password" value="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"
+						<input id="hf-token" type="password" value="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"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
 					</div>
+
 
 					<!-- —— Global Linking Settings —— -->
 					<div class="col-span-1 md:col-span-2 border-t border-gray-600 pt-3 mt-2"></div>
@@ -477,16 +480,23 @@ class DracinApp {
 	// tampil/sembunyikan blok input sesuai gender mode
 	function toggleGenderModeUI() {
 		const mode = document.getElementById('gender-mode')?.value || 'hf_svm';
-		const showRef = (mode === 'reference');
 
-		// mode reference butuh male/female ref, sembunyikan setting hf_svm
-		document.getElementById('ref-male-wrap').style.display   = showRef ? '' : 'none';
-		document.getElementById('ref-female-wrap').style.display = showRef ? '' : 'none';
+		const isReference = (mode === 'reference');
+		const isSegmentModel = (mode === 'hf_svm' || mode === 'wav2vec2');
 
-		// mode hf_svm butuh min_vote/min_len_sec
-		document.getElementById('hf-minvote-wrap').style.display = showRef ? 'none' : '';
-		document.getElementById('hf-minlen-wrap').style.display  = showRef ? 'none' : '';
+		// reference butuh male/female ref
+		document.getElementById('ref-male-wrap').style.display   = isReference ? '' : 'none';
+		document.getElementById('ref-female-wrap').style.display = isReference ? '' : 'none';
+
+		// segment models (hf_svm/wav2vec2) pakai min_vote/min_len_sec
+		document.getElementById('hf-minvote-wrap').style.display = isSegmentModel ? '' : 'none';
+		document.getElementById('hf-minlen-wrap').style.display  = isSegmentModel ? '' : 'none';
+
+		// "Top N Segments":
+		//   hanya relevan buat reference (dia pakai top_n segmen terpanjang per speaker buat centroid)
+		document.getElementById('top-n').disabled = !isReference;
 	}
+
 
 	// pas pertama render SRT tab:
 	toggleGenderModeUI();
@@ -817,124 +827,133 @@ class DracinApp {
 
 	// Tab 1 – Diarization
 	async runDiarization() {
-	  if (!this.currentSessionId) {
-		this.showNotification('Create Session dulu.', 'error');
-		return;
-	  }
-
-	  // --- ambil semua elemen UI ---
-	  const modeEl        = document.getElementById('gender-mode');
-	  const maleRefEl     = document.getElementById('male-ref');
-	  const femaleRefEl   = document.getElementById('female-ref');
-	  const minVoteEl     = document.getElementById('min-vote');
-	  const minLenEl      = document.getElementById('min-len-sec');
-
-	  const topNEl        = document.getElementById('top-n');
-	  const hfTokenEl     = document.getElementById('hf-token');
-	  const useGpuEl      = document.getElementById('use-gpu');
-
-	  const linkGlobalEl    = document.getElementById('link-global');
-	  const linkThresholdEl = document.getElementById('link-threshold');
-	  const spsEl           = document.getElementById('samples-per-spk');
-	  const minSpeakersEl   = document.getElementById('min-speakers');
-	  const maxSpeakersEl   = document.getElementById('max-speakers');
-	  const minSampleDurEl  = document.getElementById('min-sample-dur');
-
-	  // --- ambil nilai ---
-	  const gender_mode   = (modeEl?.value || 'hf_svm').trim(); // "hf_svm" / "reference"
-	  const male_ref      = (maleRefEl?.value || '').trim();
-	  const female_ref    = (femaleRefEl?.value || '').trim();
-
-	  const min_vote      = (minVoteEl?.value || '0.7').trim();
-	  const min_len_sec   = (minLenEl?.value || '0.3').trim();
-
-	  const top_n         = topNEl?.value ? parseInt(topNEl.value, 10) : 6;
-	  const hf_token      = (hfTokenEl?.value || '').trim();
-	  const use_gpu       = useGpuEl?.checked ? 'true' : 'false';
-
-	  const link_global     = linkGlobalEl?.checked ? 'true' : 'false';
-	  const link_threshold  = linkThresholdEl?.value || '0.93';
-	  const samples_per_spk = spsEl?.value || '8';
-	  const min_speakers    = minSpeakersEl?.value || '';
-	  const max_speakers    = maxSpeakersEl?.value || '';
-	  const min_sample_dur  = minSampleDurEl?.value || '1';
-
-	  // --- validasi ringan ---
-	  if (gender_mode === 'reference') {
-		if (!male_ref || !female_ref) {
-		  this.showNotification('Male/Female Reference wajib diisi untuk mode Reference.', 'error');
-		  return;
-		}
-	  }
-
-	  if (!hf_token) {
-		this.showNotification('HF Token wajib diisi.', 'error');
-		return;
-	  }
-
-	  // --- siapkan body request sesuai backend baru kita ---
-	  const body = new URLSearchParams();
-	  body.append('gender_mode', gender_mode);
-	  body.append('hf_token', hf_token);
-	  body.append('use_gpu', use_gpu);
-	  body.append('top_n', String(top_n));
-
-	  if (gender_mode === 'reference') {
-		body.append('male_ref', male_ref);
-		body.append('female_ref', female_ref);
-		// (mode lama tidak butuh min_vote/min_len_sec)
-	  } else {
-		// hf_svm mode
-		body.append('min_vote', String(min_vote));
-		body.append('min_len_sec', String(min_len_sec));
-		// (hf_svm tidak butuh male_ref/female_ref)
-	  }
-
-	  // global linking
-	  body.append('link_global', link_global);
-	  body.append('link_threshold', String(link_threshold));
-	  body.append('samples_per_spk', String(samples_per_spk));
-	  if (min_speakers) body.append('min_speakers', String(parseInt(min_speakers, 10)));
-	  if (max_speakers) body.append('max_speakers', String(parseInt(max_speakers, 10)));
-	  body.append('min_sample_dur', String(min_sample_dur));
-
-	  const url = `/api/session/${this.currentSessionId}/diarization`;
-
-	  try {
-		this.appendLog?.('Running diarization...');
-		this.showLoading('Running diarization...');
-
-		const res = await fetch(url, {
-		  method: 'POST',
-		  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-		  body,
-		});
-
-		const text = await res.text();
-
-		if (!res.ok) {
-		  this.showNotification(`Failed to run diarization: ${text}`, 'error');
-		  this.appendLog?.(text);
-		  return;
+		if (!this.currentSessionId) {
+			this.showNotification('Create Session dulu.', 'error');
+			return;
 		}
 
-		let data = {};
-		try { data = JSON.parse(text); } catch (_) {}
+		// ambil semua elemen UI
+		const modeEl        = document.getElementById('gender-mode');
+		const maleRefEl     = document.getElementById('male-ref');
+		const femaleRefEl   = document.getElementById('female-ref');
+		const minVoteEl     = document.getElementById('min-vote');
+		const minLenEl      = document.getElementById('min-len-sec');
+		const topNEl        = document.getElementById('top-n');
+		const hfTokenEl     = document.getElementById('hf-token');
+		const useGpuEl      = document.getElementById('use-gpu');
 
-		const segPath = data.segments_path || data.segjson || '';
-		const spkPath = data.speakers_path || data.spkjson || '';
+		const linkGlobalEl    = document.getElementById('link-global');
+		const linkThresholdEl = document.getElementById('link-threshold');
+		const spsEl           = document.getElementById('samples-per-spk');
+		const minSpeakersEl   = document.getElementById('min-speakers');
+		const maxSpeakersEl   = document.getElementById('max-speakers');
+		const minSampleDurEl  = document.getElementById('min-sample-dur');
 
-		if (segPath) this.appendLog?.(`Segments: ${segPath}`);
-		if (spkPath) this.appendLog?.(`Speakers: ${spkPath}`);
+		// nilai
+		const gender_mode   = (modeEl?.value || 'hf_svm').trim(); // "hf_svm"/"wav2vec2"/"reference"
+		const male_ref      = (maleRefEl?.value || '').trim();
+		const female_ref    = (femaleRefEl?.value || '').trim();
 
-		this.updateProgress?.(100, 'Diarization done');
-		this.showNotification('Diarization completed successfully', 'success');
-	  } catch (err) {
-		this.showNotification(`Failed to run diarization: ${err?.message || err}`, 'error');
-	  } finally {
-		this.hideLoading();
-	  }
+		const min_vote      = (minVoteEl?.value || '0.7').trim();
+		const min_len_sec   = (minLenEl?.value || '0.3').trim();
+
+		const top_n         = topNEl?.value ? parseInt(topNEl.value, 10) : 5;
+		const hf_token      = (hfTokenEl?.value || '').trim();
+		const use_gpu       = useGpuEl?.checked ? 'true' : 'false';
+
+		const link_global     = linkGlobalEl?.checked ? 'true' : 'false';
+		const link_threshold  = linkThresholdEl?.value || '0.93';
+		const samples_per_spk = spsEl?.value || '8';
+		const min_speakers    = minSpeakersEl?.value || '';
+		const max_speakers    = maxSpeakersEl?.value || '';
+		const min_sample_dur  = minSampleDurEl?.value || '1';
+
+		// validasi
+		if (!hf_token) {
+			this.showNotification('HF Token wajib diisi.', 'error');
+			return;
+		}
+
+		if (gender_mode === 'reference') {
+			if (!male_ref || !female_ref) {
+				this.showNotification('Male/Female Reference wajib diisi untuk mode reference.', 'error');
+				return;
+			}
+		}
+
+		// body request ke backend
+		const body = new URLSearchParams();
+		body.append('gender_mode', gender_mode);        // "hf_svm"/"wav2vec2"/"reference"
+		body.append('hf_token', hf_token);
+		body.append('use_gpu', use_gpu);
+		body.append('top_n', String(top_n));
+
+		if (gender_mode === 'reference') {
+			body.append('male_ref', male_ref);
+			body.append('female_ref', female_ref);
+			// reference ga pakai min_vote/min_len_sec
+		} else {
+			// hf_svm atau wav2vec2 (segment-wise)
+			body.append('min_vote', String(min_vote));
+			body.append('min_len_sec', String(min_len_sec));
+		}
+
+		// global linking config (masih kita kirim walau backend boleh aja ignore)
+		body.append('link_global', link_global);
+		body.append('link_threshold', String(link_threshold));
+		body.append('samples_per_spk', String(samples_per_spk));
+		if (min_speakers) body.append('min_speakers', String(parseInt(min_speakers, 10)));
+		if (max_speakers) body.append('max_speakers', String(parseInt(max_speakers, 10)));
+		body.append('min_sample_dur', String(min_sample_dur));
+
+		const url = `/api/session/${this.currentSessionId}/diarization`;
+
+		try {
+			this.appendLog?.('Running diarization...');
+			this.showLoading('Running diarization...');
+
+			const res = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			});
+
+			const text = await res.text();
+
+			if (!res.ok) {
+				this.showNotification(`Failed to run diarization: ${text}`, 'error');
+				this.appendLog?.(text);
+				return;
+			}
+
+			let data = {};
+			try { data = JSON.parse(text); } catch (_) {}
+
+			// backend baru balikin:
+			// {
+			//   status: "diarization_completed",
+			//   speaker_timeline_raw: "...",
+			//   speaker_timeline_linked: "...",  (mungkin kosong "")
+			//   gender_timeline: "..."
+			// }
+			const rawPath     = data.speaker_timeline_raw || '';
+			const linkedPath  = data.speaker_timeline_linked || '';
+			const genderPath  = data.gender_timeline || '';
+
+			if (rawPath)    this.appendLog?.(`speaker_timeline_raw: ${rawPath}`);
+			if (linkedPath) this.appendLog?.(`speaker_timeline_linked: ${linkedPath}`);
+			if (genderPath) this.appendLog?.(`gender_timeline: ${genderPath}`);
+
+			this.updateProgress?.(100, 'Diarization done');
+			this.showNotification('Diarization completed successfully', 'success');
+
+		} catch (err) {
+			this.showNotification(`Failed to run diarization: ${err?.message || err}`, 'error');
+		} finally {
+			this.hideLoading();
+		}
 	}
+
 
 
     updateProgress(percent, message) {
@@ -2701,9 +2720,22 @@ tab.innerHTML = `
 		</label>
 
       <div class="ml-auto flex items-center gap-2">
+	  <!-- Tambahan control jangkauan scan -->
+<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;margin-right:8px;">
+  <span></span>
+  <input
+    id="edSyncRange"
+    type="number"
+    step="0.1"
+    min="0.5"
+    value="1"
+    style="width:60px;padding:2px 4px;font-weight: bold; font-size:12px;color:red;"
+    title="Seberapa jauh (detik) subtitle boleh digeser ke suara. 2.5 = ±2.5 detik."
+  />
+</label>
 		<button id="ed-auto-sync"
 		  class="bg-purple-600 hover:bg-purple-700 px-3 py-2 rounded text-white text-sm flex items-center">
-		  <i class="fas fa-clock mr-1"></i>Auto Sync Timing
+		  <i class="fas fa-clock mr-1"></i>Auto Sync
 		</button>
         <button id="ed-save" class="btn btn-primary px-3 py-1">Save</button>
         <button id="ed-merge" class="btn bg-green-500 px-3 py-1" disabled>Gabung Subtitle</button>
@@ -2751,8 +2783,8 @@ tab.innerHTML = `
           <!-- Gender & Speaker Row -->
           <div class="flex items-center gap-2">
             <span class="text-sm text-gray-300">Gender:</span>
-            <button id="ed-bulk-g-m" class="btn bg-pink-500 px-2 py-1 border rounded text-sm">MALE</button>
-            <button id="ed-bulk-g-f" class="btn bg-blue-500 px-2 py-1 border rounded text-sm">FEMALE</button>
+            <button id="ed-bulk-g-m" class="btn bg-blue-500 px-2 py-1 border rounded text-sm">MALE</button>
+            <button id="ed-bulk-g-f" class="btn bg-pink-500 px-2 py-1 border rounded text-sm">FEMALE</button>
             <button id="ed-bulk-g-u" class="px-2 py-1 border rounded text-sm">Unknown</button>
 
             <span class="text-sm text-gray-300 ml-2">Speaker:</span>
@@ -2761,7 +2793,8 @@ tab.innerHTML = `
             <button id="ed-bulk-set-speaker" class="btn bg-blue-500 px-2 py-1 border rounded text-sm">
               Ubah
             </button>
-			            <button id="ed-undo" class="btn bg-red-500 px-2 py-1 border rounded text-sm">Undo / Mundur</button>
+			
+			<button id="ed-undo" class="btn bg-red-500 px-2 py-1 border rounded text-sm">Undo / Mundur</button>
             <button id="ed-redo" class="btn bg-green-500 px-2 py-1 border rounded text-sm">Redo / Maju</button>
           </div>
 
@@ -2774,39 +2807,31 @@ tab.innerHTML = `
           <div class="flex items-center gap-2">
             <label class="text-sm text-gray-300 whitespace-nowrap w-24">ASSIGN_POLICY:</label>
 			
-            <select id="assign-policy" class="bg-gray-600 border border-gray-500 rounded px-2 py-1 text-white text-sm flex-1">
-			  <option value="overlap">overlap</option>
-			  <option value="start">start</option>
-			  <option value="end">end</option>
-			  <option value="midpoint">midpoint</option>
-			  <option value="majority_then_start">majority_then_start</option>
-			  <option value="majority_then_midpoint">majority_then_midpoint</option>
-			  <option value="adaptive" selected>adaptive</option>  <!-- default -->
-            </select>
-          </div>
+<div class="flex items-center gap-4">
+  <div class="flex items-center gap-2 flex-1">
+    <label class="text-sm text-gray-300 whitespace-nowrap">
+      Sync Preview (ms):
+    </label>
+    <input id="sync-preview-ms"
+           type="number"
+           step="50"
+           value="0"
+           class="bg-gray-600 border border-gray-500 rounded px-2 py-1 text-white text-sm w-24"
+           title="Coba geser subtitle start secara virtual. Contoh: 600 = seolah semua subtitle maju 600ms."
+    >
+  </div>
 
-          <!-- MAJORITY & SNAP_MS Row -->
-          <div class="flex items-center gap-4">
-            <div class="flex items-center gap-2 flex-1">
-              <label class="text-sm text-gray-300 whitespace-nowrap w-16">MAJORITY:</label>
-              <input id="majority" type="number" min="0" max="1" step="0.05" value="0.60"
-                     class="bg-gray-600 border border-gray-500 rounded px-2 py-1 text-white text-sm w-20">
-            </div>
+  <div class="flex items-center gap-2">
+    <button id="ed-apply-mapping"
+            class="btn bg-blue-600 px-3 py-1 rounded text-sm">
+      Check Sync
+    </button>
+    <span class="text-xs text-gray-400">
+      Hijau = ≤0.5s, Kuning = 0.5–1.5s, Merah = >1.5s
+    </span>
+  </div>
+</div>
 
-            <div class="flex items-center gap-2 flex-1">
-              <label class="text-sm text-gray-300 whitespace-nowrap w-16">SNAP_MS:</label>
-              <input id="snap-ms" type="number" min="0" step="10" value="120"
-                     class="bg-gray-600 border border-gray-500 rounded px-2 py-1 text-white text-sm w-20">
-            </div>
-          </div>
-
-          <!-- Apply Button & Note -->
-          <div class="flex items-center gap-2">
-            <button id="ed-apply-mapping" class="btn bg-blue-600 px-3 py-1 rounded text-sm">
-              Apply Mapping
-            </button>
-            <span class="text-xs text-gray-400">0 = matikan snapping</span>
-          </div>
         </div>
       </div>
     </div>
@@ -3062,6 +3087,8 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
   this._edFilterRender();
 });
   // Auto Sync Timing (geser subtitle vs voice, server-side)
+  this.syncPreviewInput = document.getElementById('sync-preview-ms');
+  this.edSyncRangeInput = document.getElementById('edSyncRange');
   const autoBtn = document.getElementById('ed-auto-sync');
   if (autoBtn && !autoBtn._bound) {
     autoBtn._bound = true;
@@ -3080,12 +3107,17 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
   });
 
   // APPLY MAPPING → re-fetch dengan policy/majority/snap terbaru
-  document.getElementById('ed-apply-mapping')?.addEventListener('click', async () => {
-    const sid = this.editing?.sessionId || this.currentSessionId
-            || document.getElementById('ed-session-input')?.value?.trim();
-    if (!sid) return this.showNotification('Load session dulu.', 'warning');
-    await this._edLoad(sid);
-  });
+	document.getElementById('ed-apply-mapping')?.addEventListener('click', async () => {
+	  const sid = this.editing?.sessionId || this.currentSessionId
+			   || document.getElementById('ed-session-input')?.value?.trim();
+	  if (!sid) {
+		this.showNotification('Load session dulu.', 'warning');
+		return;
+	  }
+
+	  await this._edLoad(sid, { previewShiftMsOverride: true });
+	});
+
 
   $('ed-session-select')?.addEventListener('change', async (e) => {
     const id = e.target.value;
@@ -3177,25 +3209,58 @@ document.getElementById('ed-warn-only')?.addEventListener('change', () => {
 }
 
 async edAutoSync() {
-  if (!this.currentSessionId) return this.showNotification('No active session', 'error');
+  if (!this.currentSessionId) {
+    return this.showNotification('No active session', 'error');
+  }
+
+  // ambil toleransi dari UI. default fallback 2.5 detik
+  let rangeSec = 2.5;
+  if (this.edSyncRangeInput) {
+    const v = parseFloat(this.edSyncRangeInput.value);
+    if (!isNaN(v) && v > 0) {
+      rangeSec = v;
+    }
+  }
+
+  // konversi ke ms
+  const rangeMs = Math.round(rangeSec * 1000);
+
+  // kita pakai 1 angka ini utk:
+  // - radius_ms  (scan sejauh ini)
+  // - snap_ms    (boleh loncat sejauh ini)
+  //
+  // radius_near_ms kita kasih 2x untuk bantu fitting global (a,b)
+  const nearMs = rangeMs * 2;
+
   this.showLoading('Auto-syncing timing (V5)…');
+
   try {
     const res = await fetch(`/api/session/${this.currentSessionId}/editing/auto-sync-v5`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        snap_ms: 400,
-        radius_ms: 600,
-        radius_near_ms: 2000,
-        min_gap_ms: 30,
-        min_dur_ms: 80
+        snap_ms:        rangeMs,   // ex: 2500 ms
+        radius_ms:      rangeMs,   // ex: 2500 ms
+        radius_near_ms: nearMs,    // ex: 5000 ms
+        min_gap_ms:     30,
+        min_dur_ms:     80,
+
+        // kirim juga info grid biar konsisten dg export/CapCut
+        fps:            25.0,
+        snap_to_grid:   true,
+        snap_mode:      "nearest",
+        snap_offset_ms: 0
       })
     });
+
     const data = await res.json();
     if (!res.ok) throw new Error(data?.detail || 'Failed');
+
+    // reload tabel editing biar kelihatan waktu barunya
     await this._edLoad(this.currentSessionId);
+
     this.showNotification(
-      `Auto-sync V5 OK (anchors=${data.anchors}, a=${data.fit.a.toFixed(6)}, b=${data.fit.b_ms}ms; changed=${data.rows_changed}, g=${data.gender_changed}, sp=${data.speaker_changed})`,
+      `Auto-sync V5 OK (range=${rangeSec}s, anchors=${data.anchors}, a=${data.fit.a.toFixed(6)}, b=${data.fit.b_ms}ms; changed=${data.rows_changed}, g=${data.gender_changed}, sp=${data.speaker_changed})`,
       'success'
     );
   } catch (e) {
@@ -3204,6 +3269,8 @@ async edAutoSync() {
     this.hideLoading();
   }
 }
+
+
 
 
 
@@ -3284,79 +3351,118 @@ _edHistoryInit() {
   }
 }
 
-async _edLoad(sessionId) {
+async _edLoad(sessionId, opts = {}) {
   const ed = this.editing;
   this.showLoading('Loading editing data…');
+
   try {
+    // 1. Ambil parameter "lama" (assign_policy / majority / snap_ms)
+    //    Kita masih kirim supaya backend gak error,
+    //    walaupun di UI baru sebenarnya nanti gak dipajang lagi.
+    const polEl   = document.getElementById('assign-policy');
+    const majEl   = document.getElementById('majority');
+    const snapEl  = document.getElementById('snap-ms');
+
+    const pol  = polEl?.value || 'adaptive';
+    const maj  = !isNaN(parseFloat(majEl?.value))  ? String(parseFloat(majEl.value))  : '0.60';
+    const snap = !isNaN(parseInt(snapEl?.value))   ? String(parseInt(snapEl.value))   : '120';
+
+    // 2. Ambil nilai preview_shift_ms dari UI kita yang baru (sync-preview-ms)
+    //    Kalau opts.previewShiftMsOverride === true, pakai angka user.
+    //    Kalau nggak, default 0 (artinya "jangan shift, tunjukkan kondisi real").
+    let previewMs = 0;
+    if (opts.previewShiftMsOverride && this.syncPreviewInput) {
+      const v = parseInt(this.syncPreviewInput.value, 10);
+      if (!isNaN(v)) previewMs = v;
+    }
+
+    // 3. Rakit query params
     const p = new URLSearchParams({
-      assign_policy: document.getElementById('assign-policy')?.value || 'adaptive',
-      majority: String(parseFloat(document.getElementById('majority')?.value || '0.60')),
-      snap_ms: String(parseInt(document.getElementById('snap-ms')?.value || '120', 10)),
-      // KUNCI: eksplisitkan pisah jalur gender
+      assign_policy: pol,
+      majority: maj,
+      snap_ms: snap,
       gender_mode: 'segment_only',
+      preview_shift_ms: String(previewMs),
     });
+
     const url = `/api/session/${encodeURIComponent(sessionId)}/editing?${p.toString()}`;
     const res = await fetch(url);
+
     if (!res.ok) throw new Error(await res.text());
 
-    const data = await res.json(); // { video, rows:[...], speakers? }
+    // 4. Response dari backend
+    //    { video, rows:[...], speakers:[...] }
+    const data = await res.json();
+
     ed.sessionId = sessionId;
     this.currentSessionId = sessionId;
 
+    // 5. Simpan rows ke state frontend (termasuk warn_level baru)
     ed.rows = (data.rows || []).map(r => ({
-      index: r.index,
-      start: r.start,
-      end: r.end,
-      translation: r.translation || "",
-      speaker: r.speaker || "",
-      gender: (r.gender || "unknown").toLowerCase(),
-      notes: r.notes || "",
-	  // --- warning fields ---
-	  warn_level: r.warn_level || "OK",
-	  warn_codes: Array.isArray(r.warn_codes) ? r.warn_codes : [],
-	  frac_spk: r.frac_spk ?? null,
-	  frac_gen: r.frac_gen ?? null,
-	  near_start_ms: r.near_start_ms ?? null,
-	  near_end_ms: r.near_end_ms ?? null,
-	  dur_ms: r.dur_ms ?? null
-	}));
+      index:         r.index,
+      start:         r.start,
+      end:           r.end,
+      translation:   r.translation || "",
+      speaker:       r.speaker || "",
+      gender:        (r.gender || "unknown").toLowerCase(),
+      notes:         r.notes || "",
 
+      // --- warning fields dari backend ---
+      warn_level:    r.warn_level || "OK",
+      warn_codes:    Array.isArray(r.warn_codes) ? r.warn_codes : [],
+      frac_spk:      r.frac_spk ?? null,
+      frac_gen:      r.frac_gen ?? null,
+      near_start_ms: r.near_start_ms ?? null,
+      near_end_ms:   r.near_end_ms ?? null,
+      dur_ms:        r.dur_ms ?? null,
+    }));
+
+    // 6. Indexing waktu buat fitur follow video dll
     this._edIndexSeconds();
 
-    // Speakers dari backend; kalau kosong, derive dari rows
+    // 7. Speakers dropdown (masih berguna buat filter)
     ed.speakers = Array.isArray(data.speakers) && data.speakers.length
       ? data.speakers
       : [...new Set(ed.rows.map(r => (r.speaker || '').trim()).filter(Boolean))].sort();
-
     this._edPopulateSpeakerFilter(ed.speakers);
+
+    // 8. Video player panel
     ed.videoUrl = `/api/session/${encodeURIComponent(sessionId)}/video`;
 
     const info = document.getElementById('ed-session-info');
     if (info) info.textContent = `Session: ${sessionId}`;
+
     const video = document.getElementById('ed-video');
-    if (video) { video.src = ed.videoUrl; }
+    if (video) {
+      video.src = ed.videoUrl;
+    }
+
     this._edSyncListHeightToVideo();
     this._edInitVTTDefaults();
     this._edAttachVttTrack();
 
-    // seed filter awal
-    if (!this.editing.genderFilter)  this.editing.genderFilter  = 'all';
-    if (!this.editing.speakerFilter) this.editing.speakerFilter = 'all';
+    // 9. Seed filter state (genderFilter/speakerFilter/search/warnOnly)
+    if (!this.editing.genderFilter)    this.editing.genderFilter  = 'all';
+    if (!this.editing.speakerFilter)   this.editing.speakerFilter = 'all';
     if (typeof this.editing.search !== 'string') this.editing.search = '';
+    if (typeof this.editing.warnOnly !== 'boolean') this.editing.warnOnly = false;
 
-    // render pertama
+    // 10. Render daftar baris + warna merah/kuning/hijau
     this._edFilterRender();
     this._edInitBulkUI();
     this._edLoadSpeakerColors?.();
     this._edHistoryInit?.();
-	if (typeof this.editing.warnOnly !== 'boolean') this.editing.warnOnly = false;
+
+    // 11. done
     this.showNotification('Editing data loaded.', 'success');
+
   } catch (e) {
     this.showNotification(`Load editing gagal: ${e.message || e}`, 'error');
   } finally {
     this.hideLoading();
   }
 }
+
 
 
 // Patch item: { idx, key: 'gender'|'speaker'|'translation', before, after }
@@ -3370,40 +3476,39 @@ _edPushHistory(label, patches) {
   this._edSyncHistoryBtns?.();
 }
 
-_edApplyPatches(patches, dir /*'undo'|'redo'*/) {
+_edApplyPatches(patches, dir /* 'undo' | 'redo' */) {
   const ed = this.editing || {};
   let needRerender = false;
+  let timeChanged = false; // kalau start/end berubah kita refresh timing player & track
 
   for (const p of patches) {
     const row = (ed.rows || []).find(x => x.index === p.idx);
     if (!row) { needRerender = true; continue; }
+
     const val = (dir === 'undo') ? p.before : p.after;
     row[p.key] = val;
 
-    // update DOM kalau ada
     const el = document.getElementById(`row-${p.idx}`);
     if (!el) { needRerender = true; continue; }
 
     if (p.key === 'translation') {
       const inp = el.querySelector('.ed-text');
       if (inp && inp.value !== val) inp.value = val || '';
+
     } else if (p.key === 'speaker') {
       const inp = el.querySelector('.ed-speaker');
       if (inp && inp.value !== (val||'')) {
         inp.value = val || '';
-        // jika kamu pakai pewarnaan speaker:
-        if (this._edEnsureSpeakerColor) {
-          const { solid, bg } = this._edEnsureSpeakerColor(val);
-          inp.style.backgroundColor = bg;
-          inp.style.borderColor = solid;
-        }
+        const { solid, bg } = this._edEnsureSpeakerColor(val);
+        inp.style.backgroundColor = bg;
+        inp.style.borderColor     = solid;
       }
+
     } else if (p.key === 'gender') {
-      // support SELECT native:
+      // dropdown <select.ed-gender>
       const sel = el.querySelector('.ed-gender');
       if (sel) {
         sel.value = val || 'unknown';
-        // update strip & bg
         const gSolid = this._genderBorder?.(val);
         const gBg    = this._genderBg?.(val);
         if (gBg)  sel.style.backgroundColor = gBg;
@@ -3411,9 +3516,11 @@ _edApplyPatches(patches, dir /*'undo'|'redo'*/) {
           sel.style.borderColor = gSolid;
           el.style.boxShadow = `inset 4px 0 0 ${gSolid}`;
         }
+        sel.style.color = '#E5E7EB';
       }
-      // support custom popover button:
-      const gbtn = el.querySelector('.ed-gbtn .ed-glabel') ? el.querySelector('.ed-gbtn') : null;
+
+      // custom popover .ed-gbtn
+      const gbtn = el.querySelector('.ed-gbtn');
       if (gbtn) {
         const glabel = el.querySelector('.ed-glabel');
         if (glabel) glabel.textContent = val || 'unknown';
@@ -3425,11 +3532,29 @@ _edApplyPatches(patches, dir /*'undo'|'redo'*/) {
           el.style.boxShadow = `inset 4px 0 0 ${gSolid}`;
         }
       }
+
+    } else if (p.key === 'start' || p.key === 'end') {
+      // kalau timing berubah, kita tandai supaya nanti re-render sekalian kolom waktu
+      timeChanged = true;
+      needRerender = true;
     }
   }
 
-  if (needRerender) this._edRenderList?.(); // fallback jika DOM baris tidak ada
+  // kalau timing berubah (start/end), sync ulang player index & track
+  if (timeChanged) {
+    this._edIndexSeconds?.();     // refresh row.startS / row.endS buat seek & highlight
+    this._edAttachVttTrack?.();   // refresh subtitle track di video
+  }
+
+  if (needRerender) {
+    // rebuild keseluruhan list supaya kolom waktu, badge, warna dsb ikut update
+    this._edRenderList?.();
+  }
+
+  // update tombol undo/redo enable/disable
+  this._edSyncHistoryBtns?.();
 }
+
 
 _edUndo() {
   const ed = this.editing || {};
@@ -3465,19 +3590,38 @@ _edWarnBadge(row) {
 }
 
 _edWarnStyleAndTitle(row) {
-  const level = row?.warn_level || 'OK';
-  if (level === 'OK') return { style: '', title: '' };
+  const wl = row.warn_level || 'OK';
 
-  const color = (level === 'ALERT') ? '#dc2626' /* red-600 */ : '#f59e0b' /* amber-500 */;
-  const st = `border-color:${color}; box-shadow: inset 0 0 0 1px ${color};`;
-  const spk = (row?.frac_spk != null) ? `spk ${(row.frac_spk*100).toFixed(0)}%` : '';
-  const gen = (row?.frac_gen != null) ? `gen ${(row.frac_gen*100).toFixed(0)}%` : '';
-  const ns  = (row?.near_start_ms != null) ? `Δstart ${row.near_start_ms}ms` : '';
-  const ne  = (row?.near_end_ms   != null) ? `Δend ${row.near_end_ms}ms`     : '';
-  const codes = Array.isArray(row?.warn_codes) ? row.warn_codes.join(', ') : '';
-  const title = [level, codes, spk, gen, ns, ne].filter(Boolean).join(' | ');
-  return { style: st, title };
+  // pakai near_start_ms yang tadi kita set dari backend
+  const drift = (row?.near_start_ms != null)
+    ? `Δstart ${row.near_start_ms}ms`
+    : '';
+
+  // tooltip final
+  const tip = drift || 'OK';
+
+  if (wl === 'ALERT') {
+    return {
+      cls: 'bg-red-700 text-red-100 border border-red-400',
+      lbl: 'ALERT',
+      tooltip: tip || 'Audio jauh dari subtitle (start mismatch >1.5s)'
+    };
+  }
+  if (wl === 'WARN') {
+    return {
+      cls: 'bg-yellow-600 text-black border border-yellow-300',
+      lbl: 'WARN',
+      tooltip: tip || 'Masih agak meleset (0.5s–1.5s)'
+    };
+  }
+  // wl === 'OK'
+  return {
+    cls: 'bg-green-700 text-white border border-green-400',
+    lbl: 'OK',
+    tooltip: tip || 'Sudah selaras (≤0.5s)'
+  };
 }
+
 
 
 _edFilterRender(){
@@ -3511,6 +3655,99 @@ _edFilterRender(){
   this._edInitBulkSimple?.();
 }
 
+_tsToMs(tsStr) {
+  // "HH:MM:SS,mmm" -> integer ms
+  // fallback 0 kalau aneh
+  try {
+    const hh = parseInt(tsStr.slice(0, 2), 10);
+    const mm = parseInt(tsStr.slice(3, 5), 10);
+    const ss = parseInt(tsStr.slice(6, 8), 10);
+    const ms = parseInt(tsStr.slice(9, 12), 10);
+    return (((hh * 60 + mm) * 60) + ss) * 1000 + ms;
+  } catch (e) {
+    return 0;
+  }
+}
+
+_msToTs(msVal) {
+  // integer ms -> "HH:MM:SS,mmm"
+  if (msVal < 0) msVal = 0;
+  const totalSec = Math.floor(msVal / 1000);
+  const ms = msVal % 1000;
+  const ss = totalSec % 60;
+  const mm = Math.floor(totalSec / 60) % 60;
+  const hh = Math.floor(totalSec / 3600);
+
+  const pad2 = n => String(n).padStart(2, '0');
+  const pad3 = n => String(n).padStart(3, '0');
+
+  return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(ms)}`;
+}
+
+/**
+ * Geser start time baris tertentu sebesar deltaMs (bisa negatif).
+ * rowIndex = r.index (index SRT), deltaMs = ±100 misalnya.
+ */
+_edNudgeRow(idx, deltaMs) {
+  const row = (this.editing.rows || []).find(r => r.index === idx);
+  if (!row) return;
+
+  // helper parse ts -> ms
+  const parseTs = (ts) => {
+    const m = String(ts || '').match(/^(\d{2}):(\d{2}):(\d{2}),(\d{1,3})$/);
+    if (!m) return 0;
+    const hh = parseInt(m[1],10);
+    const mm = parseInt(m[2],10);
+    const ss = parseInt(m[3],10);
+    const ms = parseInt(m[4],10);
+    return (((hh*60+mm)*60)+ss)*1000 + ms;
+  };
+
+  // helper ms -> ts
+  const fmtTs = (msTotal) => {
+    if (msTotal < 0) msTotal = 0;
+    const hh = Math.floor(msTotal/3600000);
+    const mm = Math.floor((msTotal%3600000)/60000);
+    const ss = Math.floor((msTotal%60000)/1000);
+    const ms = Math.floor(msTotal%1000);
+    const pad2 = n => String(n).padStart(2,'0');
+    const pad3 = n => String(n).padStart(3,'0');
+    return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(ms)}`;
+  };
+
+  // ambil sebelum
+  const beforeStart = row.start;
+  const beforeEnd   = row.end;
+
+  // hitung baru
+  let sMs = parseTs(row.start) + deltaMs;
+  let eMs = parseTs(row.end)   + deltaMs;
+
+  // jangan minus
+  if (sMs < 0) { eMs -= sMs; sMs = 0; }
+  // durasi jangan nol
+  if (eMs < sMs + 80) eMs = sMs + 80;
+
+  // commit ke row
+  row.start = fmtTs(sMs);
+  row.end   = fmtTs(eMs);
+
+  // simpan ke history supaya bisa undo/redo
+  if (beforeStart !== row.start || beforeEnd !== row.end) {
+    this._edPushHistory(
+      `Nudge ${deltaMs>0?'+':''}${deltaMs}ms (#${idx})`,
+      [
+        { idx, key:'start', before: beforeStart, after: row.start },
+        { idx, key:'end',   before: beforeEnd,   after: row.end   }
+      ]
+    );
+  }
+
+  // perbarui detik numeric buat player & follow
+  this._edIndexSeconds();      // <- HARUS versi yg selalu overwrite startS/endS
+  this._edAttachVttTrack?.();  // refresh track <video>
+  this._edFilterRender();      // rerender list
+}
 
 
 _edRenderList() {
@@ -3543,7 +3780,6 @@ _edRenderList() {
 	  const gSolid = this._genderBorder(r.gender);
 	  const gBg    = this._genderBg(r.gender);
 
-	  // menu 3 opsi gender
 	  const gMenu = ['male','female','unknown'].map(g => {
 		const s = this._genderBorder(g);
 		const b = this._genderBg(g);
@@ -3554,18 +3790,21 @@ _edRenderList() {
 				</button>`;
 	  }).join('');
 
-	  // WARN: style & title untuk kolom time
+	  // warning style/title
 	  const { style: warnTimeStyle, title: warnTimeTitle } = this._edWarnStyleAndTitle(r);
 
 	  return `
 		<div class="ed-row grid items-center gap-2"
-			 style="grid-template-columns:28px 38px 90px 85px 1fr 48px 220px; box-shadow: inset 4px 0 0 ${gSolid};"
+			 style="grid-template-columns:28px 38px 90px 85px 1fr 48px 60px 200px; box-shadow: inset 4px 0 0 ${gSolid};"
 			 data-idx="${r.index}" id="row-${r.index}">
-		  <input type="checkbox" class="ed-chk" data-idx="${r.index}" ${ this.editing?.selected?.has(r.index) ? 'checked' : '' }>
+		  <!-- select checkbox -->
+		  <input type="checkbox" class="ed-chk" data-idx="${r.index}"
+				 ${ this.editing?.selected?.has(r.index) ? 'checked' : '' }>
 
+		  <!-- play -->
 		  <button class="ed-play btn btn-slate px-2 py-1 text-xs">▶</button>
 
-		  <!-- GENDER: custom dropdown -->
+		  <!-- gender dropdown -->
 		  <div class="ed-gwrap relative">
 			<button class="ed-gbtn border rounded text-xs px-2 py-1 w-[80px] flex items-center justify-between"
 					data-idx="${r.index}"
@@ -3578,29 +3817,56 @@ _edRenderList() {
 			</div>
 		  </div>
 
-		  <!-- SPEAKER tetap -->
+		  <!-- speaker -->
 		  <input class="ed-speaker border rounded text-xs w-full px-2 py-1"
 				 style="background-color:${this._edEnsureSpeakerColor(r.speaker).bg}; color:#F9FAFB; border-color:${this._edEnsureSpeakerColor(r.speaker).solid}"
 				 value="${esc(r.speaker||'')}" placeholder="SPEAKER_*"/>
 
-		  <!-- TRANSLATION -->
+		  <!-- translation -->
 		  <input class="ed-text bg-gray-800 border border-gray-700 text-green-400 rounded px-2 py-1 text-sm w-full
 						whitespace-nowrap overflow-hidden text-ellipsis"
 				 value="${esc(r.translation||'')}" placeholder="Translation…"/>
 
-		  <!-- #ID + WARN badge -->
-		  <div class="text-gray-400 font-mono flex items-center">
-			#${r.index} ${this._edWarnBadge(r)}   <!-- WARN -->
+		  <!-- #id + warn badge -->
+		  <div class="text-gray-400 font-mono flex items-center text-[11px] leading-tight">
+			#${r.index} ${this._edWarnBadge(r)}
 		  </div>
-		  
-		  <!-- TIME: diberi outline + tooltip saat WARN -->
-		  <div class="ed-time font-mono text-sm bg-gray-800 border border-gray-700 rounded px-2 py-1 whitespace-nowrap"
+
+<!-- NUDGE buttons -->
+<div class="ed-nudge flex flex-row items-stretch gap-1 text-[10px] leading-none">
+  <button
+    class="ed-nudge-btn bg-gray-800 border border-gray-500 rounded px-1 py-1 hover:bg-gray-600"
+    data-delta="-100"
+    data-idx="${r.index}"
+    title="Mundur 100ms">
+    -100
+  </button>
+  <button
+    class="ed-nudge-btn bg-gray-800 border border-gray-500 rounded px-1 py-1 hover:bg-gray-600"
+    data-delta="100"
+    data-idx="${r.index}"
+    title="Maju 100ms">
+    +100
+  </button>
+</div>
+
+		  <!-- TIME -->
+		  <div class="ed-time font-mono text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 whitespace-nowrap"
 			   style="${warnTimeStyle}" title="${warnTimeTitle}">
 			${r.start} <span class="opacity-60">→</span> ${r.end}
 		  </div>
 		</div>
 	  `;
 	}).join('');
+
+// NUDGE per baris (+/- 100ms)
+wrap.querySelectorAll('.ed-nudge-btn').forEach(btn => {
+  btn.addEventListener('click', e => {
+    const idx   = Number(btn.getAttribute('data-idx'));
+    const delta = parseInt(btn.getAttribute('data-delta'), 10) || 0;
+    this._edNudgeRow(idx, delta);
+  });
+});
 
 
 // toggle buka/tutup menu
@@ -3670,72 +3936,126 @@ if (!this._edGenderOutsideBound) {
       this._edUpdateMasterChk();
       this._edUpdateMergeBtn();
 
-	wrap.querySelectorAll('.ed-gender').forEach(sel=>{
-	  sel.addEventListener('change', e=>{
-		const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-		const row = this.editing.rows.find(x=>x.index===idx);
-		if (!row) return;
-		row.gender = e.target.value;
-
-		const gSolid = this._genderBorder(row.gender);
-		const gBg    = this._genderBg(row.gender);
-		sel.style.backgroundColor = gBg;         // penting: backgroundColor
-		sel.style.borderColor     = gSolid;
-		sel.style.color           = '#E5E7EB';
-	  });
-	});
-
-// TRANSLATION
-wrap.querySelectorAll('.ed-text').forEach(inp=>{
-  // simpan nilai awal saat fokus
-  inp.addEventListener('focus', e=>{
+wrap.querySelectorAll('.ed-gender').forEach(sel => {
+  sel.addEventListener('change', e => {
     const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    e.target.dataset._orig = this.editing.rows.find(x=>x.index===idx)?.translation || '';
-  });
-  // update model realtime
-  inp.addEventListener('input', e=>{
-    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    const row = this.editing.rows.find(x=>x.index===idx);
-    if (row) row.translation = e.target.value;
-  });
-  // saat blur → push ke history kalau berubah
-  inp.addEventListener('blur', e=>{
-    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    const row = this.editing.rows.find(x=>x.index===idx);
+    const row = this.editing.rows.find(x => x.index === idx);
     if (!row) return;
-    const before = e.target.dataset._orig ?? '';
-    const after  = e.target.value || '';
+
+    const before = row.gender || 'unknown';
+    const after  = e.target.value || 'unknown';
+
     if (before !== after) {
-      this._edPushHistory(`Edit text (#${idx})`, [{ idx, key:'translation', before, after }]);
+      this._edPushHistory(`Set gender (#${idx})`, [
+        { idx, key:'gender', before, after }
+      ]);
+
+      row.gender = after;
+    }
+
+    const gSolid = this._genderBorder(after);
+    const gBg    = this._genderBg(after);
+    sel.style.backgroundColor = gBg;
+    sel.style.borderColor     = gSolid;
+    sel.style.color           = '#E5E7EB';
+
+    // update garis kiri row juga biar konsisten visual
+    const rowEl = document.getElementById(`row-${idx}`);
+    if (rowEl) {
+      rowEl.style.boxShadow = `inset 4px 0 0 ${gSolid}`;
     }
   });
 });
 
-// SPEAKER
-wrap.querySelectorAll('.ed-speaker').forEach(inp=>{
-  inp.addEventListener('focus', e=>{
+// TRANSLATION
+wrap.querySelectorAll('.ed-text').forEach(inp => {
+  // simpan nilai awal saat fokus (buat fallback info/UX, tapi bukan satu-satunya)
+  inp.addEventListener('focus', e => {
     const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    e.target.dataset._orig = this.editing.rows.find(x=>x.index===idx)?.speaker || '';
+    const row = this.editing.rows.find(x => x.index === idx);
+    // simpan baseline terakhir yang sudah known editor
+    e.target.dataset._lastVal = row ? (row.translation || '') : '';
   });
-  inp.addEventListener('input', e=>{
-    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    const row = this.editing.rows.find(x=>x.index===idx);
-    if (!row) return;
-    row.speaker = e.target.value;
 
-    // pewarnaan langsung
+  // setiap kali user ngetik, kita dorong 1 langkah history (before -> after)
+  inp.addEventListener('input', e => {
+    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
+    const row = this.editing.rows.find(x => x.index === idx);
+    if (!row) return;
+
+    const before = row.translation || '';
+    const after  = e.target.value || '';
+
+    if (before !== after) {
+      // record langkah ini ke undo stack
+      this._edPushHistory(`Edit text (#${idx})`, [
+        { idx, key: 'translation', before, after }
+      ]);
+
+      // update modelnya
+      row.translation = after;
+
+      // update baseline terakhir yg tersimpan di input (supaya step berikutnya compare lagi dari sini)
+      e.target.dataset._lastVal = after;
+    }
+  });
+
+  // kalau blur, kita gak perlu lagi dorong history besar,
+  // tapi bisa kita pakai buat sync "row.translation" kalau user gak ketik apapun setelah fokus
+  inp.addEventListener('blur', e => {
+    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
+    const row = this.editing.rows.find(x => x.index === idx);
+    if (!row) return;
+
+    const after = e.target.value || '';
+    // row.translation seharusnya sudah sama 'after' karena di 'input' kita update setiap ketik,
+    // tapi buat jaga2:
+    if (row.translation !== after) {
+      const before = row.translation || '';
+      this._edPushHistory(`Edit text (#${idx})`, [
+        { idx, key: 'translation', before, after }
+      ]);
+      row.translation = after;
+    }
+  });
+});
+
+
+// SPEAKER
+wrap.querySelectorAll('.ed-speaker').forEach(inp => {
+  // catat nilai awal saat fokus
+  inp.addEventListener('focus', e => {
+    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
+    const row = this.editing.rows.find(x => x.index === idx);
+    e.target.dataset._origSpeaker = row ? (row.speaker || '') : '';
+  });
+
+  // update model dan warna LIVE saat ngetik
+  inp.addEventListener('input', e => {
+    const idx = Number(e.target.closest('[data-idx]').dataset.idx);
+    const row = this.editing.rows.find(x => x.index === idx);
+    if (!row) return;
+
+    row.speaker = e.target.value || '';
+
     const { solid, bg } = this._edEnsureSpeakerColor(row.speaker);
     e.target.style.backgroundColor = bg;
     e.target.style.borderColor     = solid;
   });
-  inp.addEventListener('blur', e=>{
+
+  // pas blur: baru kita push 1 history step
+  inp.addEventListener('blur', e => {
     const idx = Number(e.target.closest('[data-idx]').dataset.idx);
-    const row = this.editing.rows.find(x=>x.index===idx);
+    const row = this.editing.rows.find(x => x.index === idx);
     if (!row) return;
-    const before = e.target.dataset._orig ?? '';
-    const after  = e.target.value || '';
+
+    const before = e.target.dataset._origSpeaker ?? '';
+    const after  = row.speaker || '';
+
     if (before !== after) {
-      this._edPushHistory(`Set speaker (#${idx})`, [{ idx, key:'speaker', before, after }]);
+      this._edPushHistory(`Set speaker (#${idx})`, [
+        { idx, key:'speaker', before, after }
+      ]);
     }
   });
 });
@@ -3836,14 +4156,17 @@ _edToSec(t){ const m=t?.match?.(/(\d+):(\d+):(\d+),(\d+)/); if(!m) return 0;
   return (+m[1])*3600+(+m[2])*60+(+m[3])+((+m[4])/1000); }
 
 // panggil sekali saat selesai _edLoad(): tambahkan startS/endS ke setiap row
-_edIndexSeconds(){
-  (this.editing.rows || []).forEach(r=>{
-    const m = (t)=> {
-      const x = (t||'').match(/(\d+):(\d+):(\d+),(\d+)/);
-      return x ? (+x[1])*3600+(+x[2])*60+(+x[3])+(+x[4])/1000 : 0;
+_edIndexSeconds() {
+  (this.editing.rows || []).forEach(r => {
+    const m = (t) => {
+      const x = (t || '').match(/(\d+):(\d+):(\d+),(\d+)/);
+      return x
+        ? (+x[1]) * 3600 + (+x[2]) * 60 + (+x[3]) + (+x[4]) / 1000
+        : 0;
     };
-    r.startS = r.startS ?? m(r.start);
-    r.endS   = r.endS   ?? m(r.end);
+    // selalu overwrite, jangan pakai ?? lagi
+    r.startS = m(r.start);
+    r.endS   = m(r.end);
   });
 }
 
@@ -3884,23 +4207,49 @@ _edAutoResizeTextareas(){
 }
 
 async _edSave() {
-  const ed = this.editing;
-  if (!ed.sessionId) return this.showNotification('No session.', 'warning');
+  const ed = this.editing || {};
+  if (!ed.rows || !ed.rows.length) {
+    return this.showNotification('Tidak ada data untuk disave.', 'warning');
+  }
+
+  this.showLoading('Saving editing data…');
   try {
-    this.showLoading('Saving editing…');
-    const res = await fetch(`/api/session/${ed.sessionId}/editing`, {
+    const sid = this.currentSessionId || this.editing?.sessionId;
+    const payload = {
+      rows: ed.rows.map(r => ({
+        index: r.index,
+        start: r.start,
+        end:   r.end,
+        translation: r.translation || "",
+        speaker:     r.speaker || "",
+        gender:      (r.gender || "unknown").toLowerCase(),
+        notes:       r.notes || ""
+      }))
+    };
+
+    const res = await fetch(`/api/session/${encodeURIComponent(sid)}/editing`, {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ rows: ed.rows })
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error(await res.text());
+    const txt = await res.text();
+    if (!res.ok) throw new Error(txt || 'Save gagal');
+
+    // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    // RESET HISTORY DI SINI
+    ed._undo = [];
+    ed._redo = [];
+    this._edSyncHistoryBtns?.(); // disable tombol Undo/Redo di UI
+    // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     this.showNotification('Saved.', 'success');
   } catch (e) {
-    this.showNotification(`Save failed: ${e.message || e}`, 'error');
+    this.showNotification(`Save error: ${e.message||e}`, 'error');
   } finally {
     this.hideLoading();
   }
 }
+
 
 async _edExport(mode, extra = {}) {
   const ed = this.editing;
@@ -4291,459 +4640,683 @@ async _edExport(mode, extra = {}) {
     }
 
 // ========= OCR EDITING V1 =========
-// ========= OK =========
-	/* ========= OCR — util kecil ========= */
-	_ocrToSec(s){
-	  if (typeof this._edToSec === 'function') return this._edToSec(s);
-	  const m = String(s||'').match(/(\d+):(\d+):(\d+),(\d+)/);
-	  if (!m) return 0;
-	  return (+m[1])*3600 + (+m[2])*60 + (+m[3]) + (+m[4])/1000;
-	}
-	_ocrEsc(s){
-	  if (typeof this.escapeHtml === 'function') return this.escapeHtml(String(s||''));
-	  return String(s||'').replace(/[&<>\"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
-	}
+// ========= OCR EDITING V2 (DUP detect + MERGE) =========
+// ========= FRONTEND-ONLY =================================
 
-	/* ========= OCR — state ========= */
-	initOcrState(){
-	  if (this.ocr) return;
-	  this.ocr = {
-		rows: [], filtered: [],
-		search: '', onlyWarn: false, onlyWarnID: false,
-		videoUrl: null, playUntil: null, liveIndex: null,
-		// CC/OSD controls
-		cc: { font: 18, bottomPct: 6, widthPct: 90 }  // px & persen dari bawah
-	  };
-	}
+/* ========= OCR — util kecil ========= */
+_ocrToSec(s){
+  if (typeof this._edToSec === 'function') return this._edToSec(s);
+  const m = String(s||'').match(/(\d+):(\d+):(\d+),(\d+)/);
+  if (!m) return 0;
+  return (+m[1])*3600 + (+m[2])*60 + (+m[3]) + (+m[4])/1000;
+}
+_ocrTsToMs(ts){
+  const m = String(ts||'').match(/(\d+):(\d+):(\d+),(\d{1,3})/);
+  if (!m) return 0;
+  return ((+m[1])*3600 + (+m[2])*60 + (+m[3]))*1000 + (+m[4]);
+}
+_ocrMsToTs(ms){
+  ms = Math.max(0, Math.floor(ms||0));
+  const pad2 = n=>String(n).padStart(2,'0');
+  const pad3 = n=>String(n).padStart(3,'0');
+  const hh = Math.floor(ms/3600000);
+  const mm = Math.floor((ms%3600000)/60000);
+  const ss = Math.floor((ms%60000)/1000);
+  const m  = ms%1000;
+  return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(m)}`;
+}
+_ocrEsc(s){
+  if (typeof this.escapeHtml === 'function') return this.escapeHtml(String(s||''));
+  return String(s||'').replace(/[&<>\"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
 
-	/* ========= OCR — UI utama (30:70, tinggi sama, OSD CC + kontrolnya) ========= */
-	async loadOcrEditTab(){
-	  this.initOcrState();
-	  const tab = document.getElementById('ocr-edit'); if (!tab) return;
+// normalisasi teks untuk deteksi DUP (ramah CJK)
+_ocrNormalizeForDup(t){
+  let s = String(t||'').toLowerCase();
+  // buang spasi, ASCII punct, angka, simbol umum
+  s = s.replace(/[\s0-9A-Za-z.,:;!?'"`~@#$%^&*()_+\-=\[\]{}<>/\\|，。！？；：“”‘’、·…—【】（）]/g,'');
+  // kompres pengulangan 3x+ jadi 2x (aaaa → aa)
+  s = s.replace(/(.)\1{2,}/g, '$1$1');
+  return s;
+}
+// bigram utk CJK + Dice coefficient (cocok buat string pendek)
+_ocrBigrams(s){
+  const out=[];
+  for(let i=0;i<Math.max(1,s.length-1);i++) out.push(s.slice(i, i+2));
+  return out;
+}
+_ocrNearTextScore(a,b){
+  const A=this._ocrBigrams(this._ocrNormalizeForDup(a));
+  const B=this._ocrBigrams(this._ocrNormalizeForDup(b));
+  if (!A.length && !B.length) return 1;
+  const m=new Map();
+  for(const x of A) m.set(x,(m.get(x)||0)+1);
+  let inter=0, sizeA=0, sizeB=0;
+  for(const x of A) sizeA++;
+  for(const y of B){ sizeB++; const c=m.get(y)||0; if(c>0){ inter++; m.set(y,c-1); } }
+  return (2*inter)/Math.max(1,(sizeA+sizeB));
+}
+_ocrOverlapMs(a0,a1,b0,b1){
+  const s=Math.max(a0,b0), e=Math.min(a1,b1);
+  return Math.max(0, e-s);
+}
+_ocrCjkRatio(s){
+  const only=String(s||'').replace(/\s/g,'');
+  const cjk=(only.match(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g)||[]).length;
+  return only.length ? (cjk/only.length) : 0;
+}
 
-	  tab.innerHTML = `
-	  <div class="bg-gray-800 rounded-lg p-4 lg:p-6">
-		<div class="flex items-center justify-between mb-4">
-		  <h2 class="text-xl lg:text-2xl font-bold text-blue-400">
-			<i class="fas fa-broom mr-2"></i>Editing SRT OCR
-		  </h2>
-		  <div class="flex items-center gap-2">
-		  <!-- CC quick buttons -->
-<!-- CC width control -->
-<div class="mt-2 grid grid-cols-1 gap-3 text-xs text-gray-300">
-    <span class="min-w-[72px]">CC Width</span>
-    <input id="cc-width" type="range" min="40" max="100" step="1" class="flex-1" />
-    <span id="cc-width-val" class="w-10 text-right"></span>
+/* ========= OCR — state ========= */
+initOcrState(){
+  if (this.ocr) return;
+  this.ocr = {
+    rows: [], filtered: [],
+    search: '', onlyWarn: false, onlyWarnID: false,
+    videoUrl: null, playUntil: null, liveIndex: null,
+    // CC/OSD controls
+    cc: { font: 18, bottomPct: 6, widthPct: 90 }  // px & persen dari bawah
+  };
+}
 
-</div>
-			<div class="mt-2 flex items-center gap-2 text-xs text-gray-300">
-			  <button id="cc-up"    class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">CC ↑</button>
-			  <button id="cc-down"  class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">CC ↓</button>
-			  <button id="cc-plus"  class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">+</button>
-			  <button id="cc-minus" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">−</button>
-			</div>
-			<button id="ocr-load-srt" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600">
-			  <i class="fas fa-file-alt mr-2"></i>Load Subtitle
-			</button>
-			<button id="ocr-load-video" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600">
-			  <i class="fas fa-video mr-2"></i>Load Film 9:16
-			</button>
-			<div class="hidden lg:flex items-center gap-2 ml-2">
-			  <input id="ocr-search" type="text" placeholder="Search (text only)"
-					 class="px-3 py-2 rounded bg-gray-700 focus:outline-none w-56" />
-			  <label class="inline-flex items-center gap-2 select-none text-sm">
-				<input id="ocr-only-warn" type="checkbox" class="accent-blue-500" /> warnings
-			  </label>
-  <label class="inline-flex items-center gap-2 select-none text-sm">
-    <input id="ocr-only-warn-id" type="checkbox" class="accent-blue-500" /> warnings ID
-  </label>
-			</div>
-			<button id="ocr-save" class="ml-2 px-3 py-2 rounded bg-green-700 hover:bg-green-600">
-			  <i class="fas fa-save mr-2"></i>Save
-			</button>
-			<button id="ocr-export" class="px-3 py-2 rounded bg-indigo-700 hover:bg-indigo-600">
-			  <i class="fas fa-download mr-2"></i>Export
-			</button>
-		  </div>
-		</div>
+/* ========= OCR — UI utama (30:70, tinggi sama, OSD CC + kontrolnya) ========= */
+async loadOcrEditTab(){
+  this.initOcrState();
+  const tab = document.getElementById('ocr-edit'); if (!tab) return;
 
-		<div class="grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-4">
-		  <!-- LEFT: video + CC overlay + kontrol CC -->
-		  <div class="bg-gray-700 rounded-lg p-3 h-[calc(100vh-220px)] flex flex-col">
-			<div class="relative w-full flex-1 bg-black rounded overflow-hidden flex items-center justify-center">
-			  <video id="ocr-video" class="h-full w-auto"
-					 style="aspect-ratio:9/16; object-fit:contain;"
-					 controls playsinline preload="metadata"></video>
-				<div id="ocr-osd"
-					 class="absolute left-1/2 -translate-x-1/2 text-center text-white
-							bg-black/60 px-3 py-2 rounded pointer-events-none leading-tight"
-					 style="word-break: break-word;"></div>
-			</div>
-			<!-- CC controls -->
-			<div class="mt-2 grid grid-cols-2 gap-3 text-xs text-gray-300">
-			  <label class="flex items-center gap-2">
-				<span class="min-w-[72px]">CC Font</span>
-				<input id="cc-font" type="range" min="12" max="40" step="1" class="flex-1" />
-				<span id="cc-font-val" class="w-8 text-right"></span>
-			  </label>
-			  <label class="flex items-center gap-2">
-				<span class="min-w-[72px]">CC Pos (↓/↑)</span>
-				<input id="cc-pos" type="range" min="0" max="50" step="1" class="flex-1" />
-				<span id="cc-pos-val" class="w-8 text-right"></span>
-			  </label>
-			</div>
-		  </div>
+  tab.innerHTML = `
+  <div class="bg-gray-800 rounded-lg p-4 lg:p-6">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-xl lg:text-2xl font-bold text-blue-400">
+        <i class="fas fa-broom mr-2"></i>Editing SRT OCR
+      </h2>
+      <div class="flex items-center gap-2">
+        <!-- CC quick buttons -->
+        <div class="mt-2 grid grid-cols-1 gap-3 text-xs text-gray-300">
+          <span class="min-w-[72px]">CC Width</span>
+          <input id="cc-width" type="range" min="40" max="100" step="1" class="flex-1" />
+          <span id="cc-width-val" class="w-10 text-right"></span>
+        </div>
+        <div class="mt-2 flex items-center gap-2 text-xs text-gray-300">
+          <button id="cc-up"    class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">CC ↑</button>
+          <button id="cc-down"  class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">CC ↓</button>
+          <button id="cc-plus"  class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">+</button>
+          <button id="cc-minus" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">−</button>
+        </div>
 
-		  <!-- RIGHT: list (scroll hanya di kanan) -->
-		  <div class="bg-gray-700 rounded-lg p-3 h-[calc(100vh-220px)] flex flex-col">
-			<div class="flex lg:hidden items-center gap-2 mb-2">
-			  <input id="ocr-search-m" type="text" placeholder="Search (text only)"
-					 class="px-3 py-2 rounded bg-gray-800 w-full" />
-			  <label class="inline-flex items-center gap-2 text-sm">
-				<input id="ocr-only-warn-m" type="checkbox" class="accent-blue-500" /> Only warnings
-			  </label>
-			    <label class="inline-flex items-center gap-2 text-sm">
-    <input id="ocr-only-warn-id-m" type="checkbox" class="accent-blue-500" /> Only warnings ID
-  </label>
-			</div>
-			<div id="ocr-list" class="flex-1 overflow-y-auto"></div>
-		  </div>
-		</div>
-	  </div>`;
+        <button id="ocr-load-srt" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600">
+          <i class="fas fa-file-alt mr-2"></i>Load Subtitle
+        </button>
+        <button id="ocr-load-video" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600">
+          <i class="fas fa-video mr-2"></i>Load Film 9:16
+        </button>
 
-	  // set nilai default kontrol CC
-	  document.getElementById('cc-font').value = String(this.ocr.cc.font);
-	  document.getElementById('cc-font-val').textContent = String(this.ocr.cc.font);
-	  document.getElementById('cc-pos').value  = String(this.ocr.cc.bottomPct);
-	  document.getElementById('cc-pos-val').textContent  = String(this.ocr.cc.bottomPct)+'%';
-	  document.getElementById('cc-width').value = String(this.ocr.cc.widthPct);
-	  document.getElementById('cc-width-val').textContent = this.ocr.cc.widthPct + '%';
+        <div class="hidden lg:flex items-center gap-2 ml-2">
+          <input id="ocr-search" type="text" placeholder="Search (text only)"
+                 class="px-3 py-2 rounded bg-gray-700 focus:outline-none w-56" />
+          <label class="inline-flex items-center gap-2 select-none text-sm">
+            <input id="ocr-only-warn" type="checkbox" class="accent-blue-500" /> warnings
+          </label>
+          <label class="inline-flex items-center gap-2 select-none text-sm">
+            <input id="ocr-only-warn-id" type="checkbox" class="accent-blue-500" /> warnings ID
+          </label>
+        </div>
 
-	  this._ocrBindEvents();
-	  this._ocrRefreshOsdStyle();
-	  this._ocrRenderList();
-	}
+        <button id="ocr-save" class="ml-2 px-3 py-2 rounded bg-green-700 hover:bg-green-600">
+          <i class="fas fa-save mr-2"></i>Save
+        </button>
 
-	/* ========= OCR — bind events ========= */
-	_ocrBindEvents(){
-	  const $ = (id) => document.getElementById(id);
-	  const v = $('ocr-video');
-	  if (v && !v._ocrBound){
-		v.addEventListener('timeupdate', ()=> this._ocrOnVideoTime(v.currentTime));
-		v._ocrBound = true;
-	  }
-	const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+        <!-- NEW: auto merge -->
+        <button id="ocr-merge-dups" class="px-3 py-2 rounded bg-orange-600 hover:bg-orange-500">
+          <i class="fas fa-object-group mr-2"></i>Merge DUPs
+        </button>
 
-	$('cc-up')?.addEventListener('click', ()=>{
-	  this.ocr.cc.bottomPct = clamp(this.ocr.cc.bottomPct + 2, 0, 50);  // naik = lebih besar
-	  $('cc-pos').value = String(this.ocr.cc.bottomPct);
-	  $('cc-pos-val').textContent = String(this.ocr.cc.bottomPct) + '%';
-	  this._ocrRefreshOsdStyle();
-	});
-	$('cc-down')?.addEventListener('click', ()=>{
-	  this.ocr.cc.bottomPct = clamp(this.ocr.cc.bottomPct - 2, 0, 50);  // turun = lebih kecil
-	  $('cc-pos').value = String(this.ocr.cc.bottomPct);
-	  $('cc-pos-val').textContent = String(this.ocr.cc.bottomPct) + '%';
-	  this._ocrRefreshOsdStyle();
-	});
-	$('cc-plus')?.addEventListener('click', ()=>{
-	  this.ocr.cc.font = clamp(this.ocr.cc.font + 2, 12, 40);
-	  $('cc-font').value = String(this.ocr.cc.font);
-	  $('cc-font-val').textContent = String(this.ocr.cc.font);
-	  this._ocrRefreshOsdStyle();
-	});
-	$('cc-minus')?.addEventListener('click', ()=>{
-	  this.ocr.cc.font = clamp(this.ocr.cc.font - 2, 12, 40);
-	  $('cc-font').value = String(this.ocr.cc.font);
-	  $('cc-font-val').textContent = String(this.ocr.cc.font);
-	  this._ocrRefreshOsdStyle();
-	});
-	$('cc-width')?.addEventListener('input', (e)=>{
-	  this.ocr.cc.widthPct = Number(e.target.value || 90);
-	  $('cc-width-val').textContent = this.ocr.cc.widthPct + '%';
-	  this._ocrRefreshOsdStyle();
-	});
+        <button id="ocr-export" class="px-3 py-2 rounded bg-indigo-700 hover:bg-indigo-600">
+          <i class="fas fa-download mr-2"></i>Export
+        </button>
+      </div>
+    </div>
 
-	  $('ocr-load-srt')?.addEventListener('click', ()=> this._ocrPromptLoadSrt());
-	  $('ocr-load-video')?.addEventListener('click', ()=> this._ocrPromptLoadVideo());
+    <div class="grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-4">
+      <!-- LEFT: video + CC overlay + kontrol CC -->
+      <div class="bg-gray-700 rounded-lg p-3 h-[calc(100vh-220px)] flex flex-col">
+        <div class="relative w-full flex-1 bg-black rounded overflow-hidden flex items-center justify-center">
+          <video id="ocr-video" class="h-full w-auto"
+                 style="aspect-ratio:9/16; object-fit:contain;"
+                 controls playsinline preload="metadata"></video>
+          <div id="ocr-osd"
+               class="absolute left-1/2 -translate-x-1/2 text-center text-white
+                      bg-black/60 px-3 py-2 rounded pointer-events-none leading-tight"
+               style="word-break: break-word;"></div>
+        </div>
+        <!-- CC controls -->
+        <div class="mt-2 grid grid-cols-2 gap-3 text-xs text-gray-300">
+          <label class="flex items-center gap-2">
+            <span class="min-w-[72px]">CC Font</span>
+            <input id="cc-font" type="range" min="12" max="40" step="1" class="flex-1" />
+            <span id="cc-font-val" class="w-8 text-right"></span>
+          </label>
+          <label class="flex items-center gap-2">
+            <span class="min-w-[72px]">CC Pos (↓/↑)</span>
+            <input id="cc-pos" type="range" min="0" max="50" step="1" class="flex-1" />
+            <span id="cc-pos-val" class="w-8 text-right"></span>
+          </label>
+        </div>
+      </div>
 
-	  const onSearch = (e)=>{ this.ocr.search = e.target.value||''; this._ocrRenderList(); };
-	  $('ocr-search')?.addEventListener('input', onSearch);
-	  $('ocr-search-m')?.addEventListener('input', onSearch);
+      <!-- RIGHT: list (scroll hanya di kanan) -->
+      <div class="bg-gray-700 rounded-lg p-3 h-[calc(100vh-220px)] flex flex-col">
+        <div class="flex lg:hidden items-center gap-2 mb-2">
+          <input id="ocr-search-m" type="text" placeholder="Search (text only)"
+                 class="px-3 py-2 rounded bg-gray-800 w-full" />
+          <label class="inline-flex items-center gap-2 text-sm">
+            <input id="ocr-only-warn-m" type="checkbox" class="accent-blue-500" /> Only warnings
+          </label>
+          <label class="inline-flex items-center gap-2 text-sm">
+            <input id="ocr-only-warn-id-m" type="checkbox" class="accent-blue-500" /> Only warnings ID
+          </label>
+        </div>
+        <div id="ocr-list" class="flex-1 overflow-y-auto"></div>
+      </div>
+    </div>
+  </div>`;
 
-	  const onOnlyWarn = (e)=>{ this.ocr.onlyWarn = !!e.target.checked; this._ocrRenderList(); };
-	  $('ocr-only-warn')?.addEventListener('change', onOnlyWarn);
-	  $('ocr-only-warn-m')?.addEventListener('change', onOnlyWarn);
-	// (BARU) — Only warnings ID
-	const onOnlyWarnID = (e)=>{ this.ocr.onlyWarnID = !!e.target.checked; this._ocrRenderList(); };
-	$('ocr-only-warn-id')?.addEventListener('change', onOnlyWarnID);
-	$('ocr-only-warn-id-m')?.addEventListener('change', onOnlyWarnID);
+  // set nilai default kontrol CC
+  document.getElementById('cc-font').value = String(this.ocr.cc.font);
+  document.getElementById('cc-font-val').textContent = String(this.ocr.cc.font);
+  document.getElementById('cc-pos').value  = String(this.ocr.cc.bottomPct);
+  document.getElementById('cc-pos-val').textContent  = String(this.ocr.cc.bottomPct)+'%';
+  document.getElementById('cc-width').value = String(this.ocr.cc.widthPct);
+  document.getElementById('cc-width-val').textContent = this.ocr.cc.widthPct + '%';
 
-	  $('ocr-save')?.addEventListener('click', ()=> this._ocrSaveSrt());
-	  $('ocr-export')?.addEventListener('click', ()=> this._ocrExportSrt());
+  this._ocrBindEvents();
+  this._ocrRefreshOsdStyle();
+  this._ocrRenderList();
+}
 
-	  // CC controls
-	  $('cc-font')?.addEventListener('input', (e)=>{
-		this.ocr.cc.font = Number(e.target.value||18);
-		$('cc-font-val').textContent = String(this.ocr.cc.font);
-		this._ocrRefreshOsdStyle();
-	  });
-	  $('cc-pos')?.addEventListener('input', (e)=>{
-		this.ocr.cc.bottomPct = Number(e.target.value||4);
-		$('cc-pos-val').textContent = String(this.ocr.cc.bottomPct)+'%';
-		this._ocrRefreshOsdStyle();
-	  });
+/* ========= OCR — bind events ========= */
+_ocrBindEvents(){
+  const $ = (id) => document.getElementById(id);
+  const v = $('ocr-video');
+  if (v && !v._ocrBound){
+    v.addEventListener('timeupdate', ()=> this._ocrOnVideoTime(v.currentTime));
+    v._ocrBound = true;
+  }
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-	  // Delegation list
-	  const wrap = $('ocr-list');
-	  wrap?.addEventListener('click', (e)=>{
-		const btn = e.target.closest?.('[data-play]');
-		if (btn){ const idx = Number(btn.getAttribute('data-play')); this._ocrSeekToRow(idx, true); }
-	  });
-	  wrap?.addEventListener('input', (e)=>{
-		const inp = e.target.closest?.('input[data-idx]');
-		if (inp){
-		  const idx = Number(inp.getAttribute('data-idx'));
-		  const row = this.ocr.rows.find(r=>r.index===idx);
-		  if (row){
-			row.text = inp.value;                       // 1 baris
-			row.warn = this._ocrAnalyzeText(row.text);  // refresh warning
-			this._ocrRefreshRow(idx);
-		  }
-		}
-	  });
-	}
-	
-	_hasCJK(text){
-	  const t = String(text||'');
-	  try { return /\p{Script=Han}/u.test(t); }
-	  catch(e){ return /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(t); }
-	}
+  $('cc-up')?.addEventListener('click', ()=>{
+    this.ocr.cc.bottomPct = clamp(this.ocr.cc.bottomPct + 2, 0, 50);
+    $('cc-pos').value = String(this.ocr.cc.bottomPct);
+    $('cc-pos-val').textContent = String(this.ocr.cc.bottomPct) + '%';
+    this._ocrRefreshOsdStyle();
+  });
+  $('cc-down')?.addEventListener('click', ()=>{
+    this.ocr.cc.bottomPct = clamp(this.ocr.cc.bottomPct - 2, 0, 50);
+    $('cc-pos').value = String(this.ocr.cc.bottomPct);
+    $('cc-pos-val').textContent = String(this.ocr.cc.bottomPct) + '%';
+    this._ocrRefreshOsdStyle();
+  });
+  $('cc-plus')?.addEventListener('click', ()=>{
+    this.ocr.cc.font = clamp(this.ocr.cc.font + 2, 12, 40);
+    $('cc-font').value = String(this.ocr.cc.font);
+    $('cc-font-val').textContent = String(this.ocr.cc.font);
+    this._ocrRefreshOsdStyle();
+  });
+  $('cc-minus')?.addEventListener('click', ()=>{
+    this.ocr.cc.font = clamp(this.ocr.cc.font - 2, 12, 40);
+    $('cc-font').value = String(this.ocr.cc.font);
+    $('cc-font-val').textContent = String(this.ocr.cc.font);
+    this._ocrRefreshOsdStyle();
+  });
+  $('cc-width')?.addEventListener('input', (e)=>{
+    this.ocr.cc.widthPct = Number(e.target.value || 90);
+    $('cc-width-val').textContent = this.ocr.cc.widthPct + '%';
+    this._ocrRefreshOsdStyle();
+  });
 
-	/* ========= OCR — loaders ========= */
-	async _ocrPromptLoadSrt(){
-	  this.initOcrState();
-	  const input = document.createElement('input'); input.type='file'; input.accept='.srt';
-	  input.onchange = async ()=>{
-		const f = input.files?.[0]; if (!f) return;
-		const text = await f.text();
-		const list = this.parseSRT(text);
-		this.ocr.rows = list.map(r=> ({
-		  ...r,
-		  startS: this._ocrToSec(r.start),
-		  endS:   this._ocrToSec(r.end),
-		  warn:   this._ocrAnalyzeText(r.text)
-		}));
-		this._ocrRenderList();
-		this.showNotification('SRT OCR loaded','success');
-	  };
-	  input.click();
-	}
-	async _ocrPromptLoadVideo(){
-	  const input = document.createElement('input'); input.type='file'; input.accept='video/*';
-	  input.onchange = ()=>{
-		const f = input.files?.[0]; if (!f) return;
-		const url = URL.createObjectURL(f);
-		const v = document.getElementById('ocr-video');
-		if (v){ v.src = url; this.ocr.videoUrl = url; }
-	  };
-	  input.click();
-	}
+  $('ocr-load-srt')?.addEventListener('click', ()=> this._ocrPromptLoadSrt());
+  $('ocr-load-video')?.addEventListener('click', ()=> this._ocrPromptLoadVideo());
 
-	/* ========= OCR — warning rules (>=2 baris) ========= */
-	_ocrAnalyzeText(text){
-	  const warn = [];
-	  const t = String(text||'');
-	  const lines = t.split('\n');
-	  if (lines.length >= 2) warn.push('2+ lines');
-	  if (/[A-Za-z]/.test(t)) warn.push('Latin A-Z');
-	  if (/[ \t]/.test(t)) warn.push('Spaces');
-	  if (/[0-9]/.test(t)) warn.push('Digits');
-	  // CJK ratio optional
-	  const only = t.replace(/\s/g,'');
-	  const cjk = (only.match(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g)||[]).length;
-	  const non = (only.match(/[^\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g)||[]).length;
-	  const ratio = (cjk + non) ? (cjk/(cjk+non)) : 1;
-	  if (ratio < 0.8) warn.push(`Low CJK ${(ratio*100).toFixed(0)}%`);
-	  return warn;
-	}
+  const onSearch = (e)=>{ this.ocr.search = e.target.value||''; this._ocrRenderList(); };
+  $('ocr-search')?.addEventListener('input', onSearch);
+  $('ocr-search-m')?.addEventListener('input', onSearch);
 
-	/* ========= OCR — render list (tanpa pagination, search teks saja, input 1 baris) ========= */
-	_ocrRenderList(){
-	  const oc=this.ocr; if(!oc) return;
-	  const wrap=document.getElementById('ocr-list'); if(!wrap) return;
-	  const q=(oc.search||'').trim().toLowerCase();
+  const onOnlyWarn = (e)=>{ this.ocr.onlyWarn = !!e.target.checked; this._ocrRenderList(); };
+  $('ocr-only-warn')?.addEventListener('change', onOnlyWarn);
+  $('ocr-only-warn-m')?.addEventListener('change', onOnlyWarn);
 
-	// filter: Only warnings (China) + Only warnings ID + search (teks saja)
-	const rows = (oc.rows||[]).filter(r=>{
-	  const txt = String(r.text||'');
-	  const hasWarn = (r.warn && r.warn.length);
+  // Only warnings ID (baris yg mengandung Han/CJK)
+  const onOnlyWarnID = (e)=>{ this.ocr.onlyWarnID = !!e.target.checked; this._ocrRenderList(); };
+  $('ocr-only-warn-id')?.addEventListener('change', onOnlyWarnID);
+  $('ocr-only-warn-id-m')?.addEventListener('change', onOnlyWarnID);
 
-	  if (oc.onlyWarn && !hasWarn) return false;           // existing: pakai r.warn[] (mode China)
-	  if (oc.onlyWarnID && !this._hasCJK(txt)) return false; // NEW: tampilkan hanya baris yang mengandung huruf CJK (untuk input Indonesia)
+  $('ocr-save')?.addEventListener('click', ()=> this._ocrSaveSrt());
+  $('ocr-merge-dups')?.addEventListener('click', ()=> this._ocrMergeDups());
+  $('ocr-export')?.addEventListener('click', ()=> this._ocrExportSrt());
 
-	  if (!q) return true;
-	  return txt.toLowerCase().includes(q);
-	});
+  // CC sliders
+  $('cc-font')?.addEventListener('input', (e)=>{
+    this.ocr.cc.font = Number(e.target.value||18);
+    $('cc-font-val').textContent = String(this.ocr.cc.font);
+    this._ocrRefreshOsdStyle();
+  });
+  $('cc-pos')?.addEventListener('input', (e)=>{
+    this.ocr.cc.bottomPct = Number(e.target.value||4);
+    $('cc-pos-val').textContent = String(this.ocr.cc.bottomPct)+'%';
+    this._ocrRefreshOsdStyle();
+  });
 
-	  oc.filtered = rows;
+  // Delegation list
+  const wrap = $('ocr-list');
+  wrap?.addEventListener('click', (e)=>{
+    const btn = e.target.closest?.('[data-play]');
+    if (btn){ const idx = Number(btn.getAttribute('data-play')); this._ocrSeekToRow(idx, true); return; }
 
-	  if (!rows.length){
-		wrap.innerHTML = `<div class="p-4 text-gray-300">No rows.</div>`;
-		return;
-	  }
+    // tombol merge tetangga
+    const mgUp = e.target.closest?.('[data-merge-up]');
+    if (mgUp) { const idx = Number(mgUp.getAttribute('data-merge-up')); this._ocrMergeWithNeighbor(idx, -1); return; }
+    const mgDn = e.target.closest?.('[data-merge-down]');
+    if (mgDn) { const idx = Number(mgDn.getAttribute('data-merge-down')); this._ocrMergeWithNeighbor(idx, +1); return; }
+  });
 
-	  const esc = (s)=> (typeof this._ocrEsc === 'function' ? this._ocrEsc(s) : String(s||''));
-	  wrap.innerHTML = rows.map(r=>{
-		const oneLine = String(r.text||'').replace(/\n/g,' ');
-		// chip compact
-		const warnHtml = this._ocrWarnCompact(r.warn||[]);
+  wrap?.addEventListener('input', (e)=>{
+    const inp = e.target.closest?.('input[data-idx]');
+    if (inp){
+      const idx = Number(inp.getAttribute('data-idx'));
+      const row = this.ocr.rows.find(r=>r.index===idx);
+      if (row){
+        row.text = inp.value.replace(/\n/g,' ');        // 1 baris
+        row.warn = this._ocrAnalyzeText(row.text);      // refresh warning dasar
+        // re-evaluasi dup ringan (tetangga sekitar saja agar ringan)
+        this._ocrMarkDuplicateSpans({ localAround: idx });
+        this._ocrRefreshRow(idx);
+      }
+    }
+  });
+}
 
-		return `
-		  <div id="ocr-row-${r.index}" class="mb-2 rounded bg-gray-800 p-2">
-			<div class="flex items-center gap-2 whitespace-nowrap">
-						  <!-- play -->
-			  <button data-play="${r.index}"
-					  class="ml-2 px-2 py-1 shrink-0 rounded bg-gray-700 hover:bg-gray-600 text-xs">
-				<i class="fas fa-play mr-1"></i>Play
-			  </button>
-			  <!-- #no + time -->
-			  <div class="flex items-center gap-2 w-[210px] shrink-0">
-				<div class="font-mono text-xs bg-gray-900/60 px-2 py-1 rounded">#${r.index}</div>
-				<div class="font-mono text-xs text-gray-300">${esc(r.start)} → ${esc(r.end)}</div>
-			  </div>
+/* ========= OCR — helper DUP detection ========= */
 
-			  <!-- teks (1 baris, fleksibel) -->
-			  <input data-idx="${r.index}" type="text"
-					 class="flex-1 min-w-0 h-9 bg-gray-900 rounded px-2 outline-none"
-					 value="${esc(oneLine)}" />
+// tandai DUP/NEAR_DUP terhadap tetangga dalam jendela waktu
+_ocrMarkDuplicateSpans(opts={}){
+  const rows = this.ocr.rows || [];
+  if (!rows.length) return;
+  const WINDOW_MS  = 1200;              // bandingkan dengan baris yg start-nya <= 1.2s sebelumnya
+  const SIM_DUP    = 0.90;              // DUP kuat
+  const SIM_NEAR   = 0.78;              // mirip
+  const GAP_OK_MS  = 240;               // boleh jeda kecil
 
-			  <!-- warning (compact, dibatasi supaya tidak mendorong tombol) -->
-			  <div id="ocr-warn-${r.index}"
-				   class="ml-2 shrink-0 max-w-[32%] overflow-hidden">
-				${warnHtml}
-			  </div>
+  // siapkan cache timing
+  for (const r of rows){
+    r._startMs = this._ocrTsToMs(r.start);
+    r._endMs   = this._ocrTsToMs(r.end);
+    r._durMs   = Math.max(1, r._endMs - r._startMs);
+    // reset flag
+    if (!opts.localAround || Math.abs((opts.localAround - r.index)) <= 3){
+      r.dup_warn = false; r.dup_of = null; r.dup_kind = null; r.dup_sim = null;
+    }
+  }
 
+  // scan maju; bandingkan dengan beberapa baris sebelum yg dekat
+  for (let i=0; i<rows.length; i++){
+    const B = rows[i];
+    if (opts.localAround && Math.abs((opts.localAround - B.index)) > 3) continue;
 
-			</div>
-		  </div>`;
-	  }).join('');
-	}
+    let best = null; // {j, kind, sim}
+    for (let j=i-1; j>=0; j--){
+      const A = rows[j];
+      // stop jika sudah terlalu jauh waktunya
+      if ((B._startMs - A._startMs) > WINDOW_MS) break;
 
+      const sim = this._ocrNearTextScore(A.text, B.text);
+      const ov  = this._ocrOverlapMs(A._startMs, A._endMs, B._startMs, B._endMs);
+      const gap = Math.min(Math.abs(A._endMs - B._startMs), Math.abs(B._endMs - A._startMs));
+      const near = (ov > 0) || (gap <= GAP_OK_MS);
 
-	_ocrRefreshRow(idx){
-	  const row = this.ocr.rows.find(r=>r.index===idx); if (!row) return;
-	  const box = document.getElementById(`ocr-warn-${idx}`); if (!box) return;
-	  box.innerHTML = this._ocrWarnCompact(row.warn||[]);
-	}
+      let kind = null;
+      if (near && sim >= SIM_DUP)      kind = 'DUP';
+      else if (near && sim >= SIM_NEAR)kind = 'NEAR_DUP';
 
+      if (kind){
+        if (!best || sim > best.sim) best = { j, kind, sim };
+      }
+    }
 
-	/* ========= OCR — OSD CC style & text ========= */
-	_ocrRefreshOsdStyle(){
-	  const osd = document.getElementById('ocr-osd'); if (!osd) return;
-	  osd.style.fontSize = `${this.ocr.cc.font}px`;
-	  osd.style.bottom   = `${this.ocr.cc.bottomPct}%`;
-	  osd.style.width    = `${this.ocr.cc.widthPct}%`; // <= lebar kontrol
-	  osd.style.left     = '50%';
-	  osd.style.transform= 'translateX(-50%)';
-	  osd.style.whiteSpace = 'normal';
-	  osd.style.wordBreak  = 'break-word';
-	}
+    if (best){
+      B.dup_warn = true;
+      B.dup_of   = rows[best.j].index;
+      B.dup_kind = best.kind;
+      B.dup_sim  = best.sim;
+    }
+  }
+}
 
-	_ocrUpdateOsd(text){
-	  const osd = document.getElementById('ocr-osd'); if (!osd) return;
-	  osd.innerHTML = this._ocrEsc(String(text||'')).replace(/\n/g,'<br>');
-	}
+/* ========= OCR — loaders ========= */
+async _ocrPromptLoadSrt(){
+  this.initOcrState();
+  const input = document.createElement('input'); input.type='file'; input.accept='.srt';
+  input.onchange = async ()=>{
+    const f = input.files?.[0]; if (!f) return;
+    const text = await f.text();
+    const list = this.parseSRT(text);
+    this.ocr.rows = list.map(r=> ({
+      ...r,
+      startS: this._ocrToSec(r.start),
+      endS:   this._ocrToSec(r.end),
+      _startMs: this._ocrTsToMs(r.start),
+      _endMs:   this._ocrTsToMs(r.end),
+      _durMs:   Math.max(1, this._ocrTsToMs(r.end) - this._ocrTsToMs(r.start)),
+      warn:   this._ocrAnalyzeText(r.text),
+      dup_warn:false, dup_of:null, dup_kind:null, dup_sim:null
+    }));
+    this._ocrMarkDuplicateSpans();
+    this._ocrRenderList();
+    this.showNotification('SRT OCR loaded','success');
+  };
+  input.click();
+}
+async _ocrPromptLoadVideo(){
+  const input = document.createElement('input'); input.type='file'; input.accept='video/*';
+  input.onchange = ()=>{
+    const f = input.files?.[0]; if (!f) return;
+    const url = URL.createObjectURL(f);
+    const v = document.getElementById('ocr-video');
+    if (v){ v.src = url; this.ocr.videoUrl = url; }
+  };
+  input.click();
+}
 
-	// buat chip warning compact: tampilkan 2 pertama + "+N"
-	_ocrWarnCompact(warns){
-	  const esc = (s)=> (typeof this._ocrEsc === 'function' ? this._ocrEsc(s) : String(s||''));
-	  const list = Array.isArray(warns) ? warns : [];
-	  const title = esc(list.join(', '));
-	  const shown = list.slice(0, 2);
-	  const chips = shown.map(w => (
-		`<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/20 text-red-300 text-xs">⚠ ${esc(w)}</span>`
-	  )).join('');
-	  const more = (list.length > 2)
-		? `<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/20 text-red-300 text-xs cursor-default" title="${title}">+${list.length-2}</span>`
-		: '';
-	  // bungkus satu kontainer agar bisa diupdate parsial
-	  return `<div class="flex items-center gap-1" title="${title}">${chips}${more}</div>`;
-	}
+/* ========= OCR — warning rules (>=2 baris) ========= */
+_ocrAnalyzeText(text){
+  const warn = [];
+  const t = String(text||'');
+  const lines = t.split('\n');
+  if (lines.length >= 2) warn.push('2+ lines');
+  if (/[A-Za-z]/.test(t)) warn.push('Latin A-Z');
+  if (/[ \t]/.test(t)) warn.push('Spaces');
+  if (/[0-9]/.test(t)) warn.push('Digits');
+  // CJK ratio optional
+  const only = t.replace(/\s/g,'');
+  const cjk = (only.match(/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g)||[]).length;
+  const non = (only.match(/[^\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g)||[]).length;
+  const ratio = (cjk + non) ? (cjk/(cjk+non)) : 1;
+  if (ratio < 0.8) warn.push(`Low CJK ${(ratio*100).toFixed(0)}%`);
+  return warn;
+}
 
-	/* ========= OCR — playback (auto-follow list only + update OSD) ========= */
-	_ocrSeekToRow(idx, play=false){
-	  const oc=this.ocr; const v=document.getElementById('ocr-video');
-	  const r=(oc.rows||[]).find(x=>x.index===idx); if(!r||!v) return;
-	  v.currentTime = (r.startS ?? this._ocrToSec(r.start)) + 0.001;
-	  this._ocrHighlight(idx);
-	  this._ocrScrollTo(idx);
-	  this._ocrUpdateOsd(r.text);
-	  if (play){ oc.playUntil = (r.endS ?? this._ocrToSec(r.end)); v.play(); }
-	}
-	_ocrOnVideoTime(t){
-	  const oc=this.ocr; if(!oc?.rows?.length) return;
-	  const r = oc.rows.find(x=> t>=(x.startS??this._ocrToSec(x.start)) && t < (x.endS??this._ocrToSec(x.end)) );
-	  if (r){
-		this._ocrHighlight(r.index);
-		if (oc.filtered?.some?.(x=>x.index===r.index)) this._ocrScrollTo(r.index); // follow list only
-		this._ocrUpdateOsd(r.text);
-	  } else {
-		this._ocrUpdateOsd('');
-	  }
-	  if (oc.playUntil != null && t >= oc.playUntil - 0.02){
-		const v=document.getElementById('ocr-video'); v?.pause(); oc.playUntil = null;
-	  }
-	}
-	_ocrScrollTo(idx){
-	  const wrap=document.getElementById('ocr-list');
-	  const row=document.getElementById(`ocr-row-${idx}`);
-	  if(!wrap||!row) return;
-	  const top=row.offsetTop - wrap.offsetTop;
-	  wrap.scrollTo({ top: Math.max(0, top - wrap.clientHeight*0.3), behavior:'smooth' });
-	}
-	_ocrHighlight(idx){
-	  const oc=this.ocr; if(!oc) return;
-	  if (oc.liveIndex===idx) return;
-	  if (oc.liveIndex!=null){
-		const prev=document.getElementById(`ocr-row-${oc.liveIndex}`);
-		prev?.classList.remove('ring-2','ring-blue-400');
-	  }
-	  const now=document.getElementById(`ocr-row-${idx}`);
-	  now?.classList.add('ring-2','ring-blue-400');
-	  oc.liveIndex = idx;
-	}
+/* ========= OCR — render list ========= */
+_ocrRenderList(){
+  const oc=this.ocr; if(!oc) return;
+  const wrap=document.getElementById('ocr-list'); if(!wrap) return;
+  const q=(oc.search||'').trim().toLowerCase();
 
-	/* ========= OCR — save/export (download) ========= */
-	_ocrBuildSrt(renumber = true){
-	  // Ambil hanya baris yang masih punya teks (non-kosong setelah trim)
-	  const rows = (this.ocr.rows || []).filter(r => (String(r.text||'').trim().length > 0));
+  // filter: Only warnings + Only warnings ID + search
+  const rows = (oc.rows||[]).filter(r=>{
+    const txt = String(r.text||'');
+    const hasWarn = (r.warn && r.warn.length) || r.dup_warn;   // DUP juga dianggap warning
+    if (oc.onlyWarn && !hasWarn) return false;
+    if (oc.onlyWarnID && !this._hasCJK(txt)) return false;
+    if (!q) return true;
+    return txt.toLowerCase().includes(q);
+  });
 
-	  let n = 1;
-	  return rows.map(r => {
-		const idx = renumber ? (n++) : r.index;
-		const txt = String(r.text || '');
-		return `${idx}\n${r.start} --> ${r.end}\n${txt}\n`;
-	  }).join('\n');
-	}
-	_ocrSaveSrt(){
-	  const srt = this._ocrBuildSrt(true);  // renumber
-	  this._ocrDownload('ocr_cleaned.srt', srt);
-	  this.showNotification('Saved ocr_cleaned.srt','success');
-	}
-	_ocrExportSrt(){
-	  const ts=new Date(), pad=n=>String(n).padStart(2,'0');
-	  const name=`ocr_cleaned_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}.srt`;
-	  const srt=this._ocrBuildSrt(true);    // renumber
-	  this._ocrDownload(name, srt);
-	  this.showNotification(`Exported ${name}`,'success');
-	}
+  oc.filtered = rows;
 
-	_ocrDownload(name, text){
-	  const blob=new Blob([text], {type:'text/plain'}); const url=URL.createObjectURL(blob);
-	  const a=document.createElement('a'); a.href=url; a.download=name; a.click();
-	  setTimeout(()=> URL.revokeObjectURL(url), 1000);
-	}
+  if (!rows.length){
+    wrap.innerHTML = `<div class="p-4 text-gray-300">No rows.</div>`;
+    return;
+  }
+
+  const esc = (s)=> (typeof this._ocrEsc === 'function' ? this._ocrEsc(s) : String(s||''));
+  wrap.innerHTML = rows.map(r=>{
+    const oneLine = String(r.text||'').replace(/\n/g,' ');
+    const warnHtml = this._ocrWarnCompact(r.warn||[]);
+    const dupChip = r.dup_warn
+      ? `<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/30 text-red-200 text-[11px] ml-2"
+               title="similar to #${r.dup_of} (score ${(r.dup_sim*100).toFixed(0)}%)">${r.dup_kind}</span>`
+      : '';
+
+    return `
+      <div id="ocr-row-${r.index}" class="mb-2 rounded bg-gray-800 p-2">
+        <div class="flex items-center gap-2 whitespace-nowrap">
+          <!-- play -->
+          <button data-play="${r.index}"
+                  class="ml-2 px-2 py-1 shrink-0 rounded bg-gray-700 hover:bg-gray-600 text-xs">
+            <i class="fas fa-play mr-1"></i>Play
+          </button>
+          <!-- #no + time -->
+          <div class="flex items-center gap-2 w-[230px] shrink-0">
+            <div class="font-mono text-xs bg-gray-900/60 px-2 py-1 rounded">#${r.index}</div>
+            <div class="font-mono text-xs text-gray-300">${esc(r.start)} → ${esc(r.end)}</div>
+          </div>
+
+          <!-- teks -->
+          <input data-idx="${r.index}" type="text"
+                 class="flex-1 min-w-0 h-9 bg-gray-900 rounded px-2 outline-none"
+                 value="${esc(oneLine)}" />
+
+          <!-- warnings compact -->
+          <div id="ocr-warn-${r.index}" class="ml-2 shrink-0 max-w-[28%] overflow-hidden">
+            ${warnHtml}
+          </div>
+
+          <!-- DUP chip -->
+          <div id="ocr-dup-${r.index}" class="shrink-0">${dupChip}</div>
+
+          <!-- merge neighbor -->
+          <div class="shrink-0 flex items-center gap-1">
+            <button data-merge-up="${r.index}"
+                    class="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+                    title="Gabung dengan baris sebelumnya">Merge ↑</button>
+            <button data-merge-down="${r.index}"
+                    class="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+                    title="Gabung dengan baris sesudahnya">Merge ↓</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+_ocrRefreshRow(idx){
+  const row = this.ocr.rows.find(r=>r.index===idx); if (!row) return;
+  const box = document.getElementById(`ocr-warn-${idx}`); if (box) box.innerHTML = this._ocrWarnCompact(row.warn||[]);
+  const dup = document.getElementById(`ocr-dup-${idx}`);
+  if (dup) dup.innerHTML = row.dup_warn
+      ? `<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/30 text-red-200 text-[11px]"
+                 title="similar to #${row.dup_of} (score ${(row.dup_sim*100).toFixed(0)}%)">${row.dup_kind}</span>`
+      : '';
+}
+
+/* ========= OCR — OSD CC style & text ========= */
+_ocrRefreshOsdStyle(){
+  const osd = document.getElementById('ocr-osd'); if (!osd) return;
+  osd.style.fontSize = `${this.ocr.cc.font}px`;
+  osd.style.bottom   = `${this.ocr.cc.bottomPct}%`;
+  osd.style.width    = `${this.ocr.cc.widthPct}%`;
+  osd.style.left     = '50%';
+  osd.style.transform= 'translateX(-50%)';
+  osd.style.whiteSpace = 'normal';
+  osd.style.wordBreak  = 'break-word';
+}
+_ocrUpdateOsd(text){
+  const osd = document.getElementById('ocr-osd'); if (!osd) return;
+  osd.innerHTML = this._ocrEsc(String(text||'')).replace(/\n/g,'<br>');
+}
+
+// buat chip warning compact: tampilkan 2 pertama + "+N"
+_ocrWarnCompact(warns){
+  const esc = (s)=> (typeof this._ocrEsc === 'function' ? this._ocrEsc(s) : String(s||''));
+  const list = Array.isArray(warns) ? warns : [];
+  const title = esc(list.join(', '));
+  const shown = list.slice(0, 2);
+  const chips = shown.map(w => (
+    `<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/20 text-red-300 text-xs">⚠ ${esc(w)}</span>`
+  )).join('');
+  const more = (list.length > 2)
+    ? `<span class="inline-flex items-center px-2 py-0.5 rounded bg-red-600/20 text-red-300 text-xs cursor-default" title="${title}">+${list.length-2}</span>`
+    : '';
+  return `<div class="flex items-center gap-1" title="${title}">${chips}${more}</div>`;
+}
+
+/* ========= OCR — playback ========= */
+_ocrSeekToRow(idx, play=false){
+  const oc=this.ocr; const v=document.getElementById('ocr-video');
+  const r=(oc.rows||[]).find(x=>x.index===idx); if(!r||!v) return;
+  v.currentTime = (r.startS ?? this._ocrToSec(r.start)) + 0.001;
+  this._ocrHighlight(idx);
+  this._ocrScrollTo(idx);
+  this._ocrUpdateOsd(r.text);
+  if (play){ oc.playUntil = (r.endS ?? this._ocrToSec(r.end)); v.play(); }
+}
+_ocrOnVideoTime(t){
+  const oc=this.ocr; if(!oc?.rows?.length) return;
+  const r = oc.rows.find(x=> t>=(x.startS??this._ocrToSec(x.start)) && t < (x.endS??this._ocrToSec(x.end)) );
+  if (r){
+    this._ocrHighlight(r.index);
+    if (oc.filtered?.some?.(x=>x.index===r.index)) this._ocrScrollTo(r.index);
+    this._ocrUpdateOsd(r.text);
+  } else {
+    this._ocrUpdateOsd('');
+  }
+  if (oc.playUntil != null && t >= oc.playUntil - 0.02){
+    const v=document.getElementById('ocr-video'); v?.pause(); oc.playUntil = null;
+  }
+}
+_ocrScrollTo(idx){
+  const wrap=document.getElementById('ocr-list');
+  const row=document.getElementById(`ocr-row-${idx}`);
+  if(!wrap||!row) return;
+  const top=row.offsetTop - wrap.offsetTop;
+  wrap.scrollTo({ top: Math.max(0, top - wrap.clientHeight*0.3), behavior:'smooth' });
+}
+_ocrHighlight(idx){
+  const oc=this.ocr; if(!oc) return;
+  if (oc.liveIndex===idx) return;
+  if (oc.liveIndex!=null){
+    const prev=document.getElementById(`ocr-row-${oc.liveIndex}`);
+    prev?.classList.remove('ring-2','ring-blue-400');
+  }
+  const now=document.getElementById(`ocr-row-${idx}`);
+  now?.classList.add('ring-2','ring-blue-400');
+  oc.liveIndex = idx;
+}
+
+/* ========= OCR — MERGE logic ========= */
+_ocrCanMergePair(a,b, opts={}){
+  if (!a || !b) return false;
+  const gapMs   = opts.gapMs ?? 240;
+  const minSim  = opts.minSim ?? 0.78;
+  const sim = this._ocrNearTextScore(a.text, b.text);
+  const ov  = this._ocrOverlapMs(a._startMs, a._endMs, b._startMs, b._endMs);
+  const gap = Math.min(Math.abs(a._endMs - b._startMs), Math.abs(b._endMs - a._startMs));
+  return ((ov > 0) || (gap <= gapMs)) && (sim >= minSim);
+}
+_ocrMergePairObjects(a,b){
+  const sMs = Math.min(a._startMs, b._startMs);
+  const eMs = Math.max(a._endMs,   b._endMs);
+  const ta = String(a.text||'').trim();
+  const tb = String(b.text||'').trim();
+  let text='';
+  if (!ta) text=tb;
+  else if (!tb) text=ta;
+  else if (ta===tb) text=ta;
+  else if (ta.includes(tb)) text=ta;
+  else if (tb.includes(ta)) text=tb;
+  else {
+    const ra=this._ocrCjkRatio(ta), rb=this._ocrCjkRatio(tb);
+    text = (Math.abs(ra-rb)>0.02) ? (ra>rb?ta:tb) : (ta.length>=tb.length?ta:tb);
+  }
+  const m = {
+    index: Math.min(a.index, b.index),
+    start: this._ocrMsToTs(sMs),
+    end:   this._ocrMsToTs(eMs),
+    text
+  };
+  m.startS = sMs/1000; m.endS = eMs/1000;
+  m._startMs=sMs; m._endMs=eMs; m._durMs=Math.max(1,eMs-sMs);
+  m.warn = this._ocrAnalyzeText(m.text);
+  m.dup_warn=false; m.dup_of=null; m.dup_kind=null; m.dup_sim=null;
+  return m;
+}
+_ocrRenumberRows(){
+  const rows = this.ocr.rows || [];
+  for (let i=0;i<rows.length;i++) rows[i].index = i+1;
+}
+_ocrMergeWithNeighbor(idx, dir){
+  const rows = this.ocr.rows || [];
+  const pos  = rows.findIndex(r => r.index === idx);
+  if (pos < 0) return;
+  const j = pos + (dir < 0 ? -1 : +1);
+  if (j < 0 || j >= rows.length) { this.showNotification('Tidak ada tetangga untuk merge.', 'warning'); return; }
+  const A = rows[Math.min(pos,j)], B = rows[Math.max(pos,j)];
+  for (const r of [A,B]){ r._startMs ||= this._ocrTsToMs(r.start); r._endMs ||= this._ocrTsToMs(r.end); r._durMs=Math.max(1,r._endMs-r._startMs); }
+  if (!this._ocrCanMergePair(A,B)) { this.showNotification('Tidak memenuhi syarat merge (teks tidak cukup mirip / terlalu jauh waktunya).', 'warning'); return; }
+  const M = this._ocrMergePairObjects(A,B);
+  rows.splice(Math.min(pos,j), 2, M);
+  this._ocrRenumberRows();
+  this._ocrMarkDuplicateSpans();
+  this._ocrRenderList();
+  this.showNotification('Merged.', 'success');
+}
+_ocrMergeDups(opts={}){
+  const gapMs  = opts.gapMs ?? 240;
+  const minSim = opts.minSim ?? 0.78;
+  const rows = this.ocr.rows || [];
+  if (rows.length < 2) return;
+  for (const r of rows){ r._startMs=this._ocrTsToMs(r.start); r._endMs=this._ocrTsToMs(r.end); r._durMs=Math.max(1,r._endMs-r._startMs); }
+  let i=1, mergedCount=0;
+  while (i < rows.length){
+    const A = rows[i-1], B = rows[i];
+    const okFlag = (B.dup_warn && (B.dup_kind==='DUP' || B.dup_kind==='NEAR_DUP') && (B.dup_of===A.index || Math.abs(B._startMs - A._startMs) <= 1200));
+    const okHeur= this._ocrCanMergePair(A,B, { gapMs, minSim });
+    if (okFlag || okHeur){
+      const M = this._ocrMergePairObjects(A,B);
+      rows.splice(i-1, 2, M);
+      mergedCount++;
+    } else {
+      i++;
+    }
+  }
+  this._ocrRenumberRows();
+  this._ocrMarkDuplicateSpans();
+  this._ocrRenderList();
+  this.showNotification(`Merged ${mergedCount} pasangan.`, 'success');
+}
+
+/* ========= OCR — save/export (download) ========= */
+_ocrBuildSrt(renumber = true){
+  // Ambil hanya baris non-kosong
+  const rows = (this.ocr.rows || []).filter(r => (String(r.text||'').trim().length > 0));
+  let n = 1;
+  return rows.map(r => {
+    const idx = renumber ? (n++) : r.index;
+    const txt = String(r.text || '');
+    return `${idx}\n${r.start} --> ${r.end}\n${txt}\n`;
+  }).join('\n');
+}
+_ocrSaveSrt(){
+  const srt = this._ocrBuildSrt(true);
+  this._ocrDownload('ocr_cleaned.srt', srt);
+  this.showNotification('Saved ocr_cleaned.srt','success');
+}
+_ocrExportSrt(){
+  const ts=new Date(), pad=n=>String(n).padStart(2,'0');
+  const name=`ocr_cleaned_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}.srt`;
+  const srt=this._ocrBuildSrt(true);
+  this._ocrDownload(name, srt);
+  this.showNotification(`Exported ${name}`,'success');
+}
+_ocrDownload(name, text){
+  const blob=new Blob([text], {type:'text/plain'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click();
+  setTimeout(()=> URL.revokeObjectURL(url), 1000);
+}
+
+/* ========= OCR — misc ========= */
+_hasCJK(text){
+  const t = String(text||'');
+  try { return /\p{Script=Han}/u.test(t); }
+  catch(e){ return /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(t); }
+}
+
 
 	// === TAB: REVIEW & EXPORT (CapCut Project) ===
 // === TAB: REVIEW & EXPORT (Tahap 1,2,3) ===

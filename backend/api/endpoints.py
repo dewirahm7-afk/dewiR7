@@ -273,23 +273,22 @@ async def run_diarization(
     # =========================
     # GENDER CONFIG
     # =========================
-    # dropdown baru di frontend:
-    #   "reference"  -> mode lama (butuh male_ref/female_ref)
-    #   "hf_svm"     -> mode baru (pakai model griko)
+    # dropdown frontend sekarang:
+    #   "reference"   -> butuh male_ref/female_ref
+    #   "hf_svm"      -> ECAPA+SVM custom
+    #   "wav2vec2"    -> wav2vec2-large-robust-24-ft-age-gender (audeering)
     #
-    # default "reference" = aman buat UI lama
-    gender_mode: str = Form("reference"),
+    gender_mode: str = Form("hf_svm"),
 
-    # mode lama: wajib, mode baru: boleh kosong
+    # mode "reference" only:
     male_ref: Optional[str] = Form(None),
     female_ref: Optional[str] = Form(None),
 
-    # mode baru hf_svm: parameter voting
-    # (UI lama tidak mengirim field ini, tapi kita kasih default supaya tidak error)
+    # mode "hf_svm" & "wav2vec2":
     min_vote: float = Form(0.7),
     min_len_sec: float = Form(0.3),
 
-    # berapa segmen terpanjang per speaker yg dipakai buat gender
+    # umum:
     top_n: int = Form(5),
 
     # =========================
@@ -299,9 +298,10 @@ async def run_diarization(
     use_gpu: bool = Form(True),
 
     # =========================
-    # GLOBAL SPEAKER LINKING
+    # GLOBAL SPEAKER LINKING CONFIG (opsional, masih boleh ada walau
+    # diarization.py versi sekarang belum merge di sini)
     # =========================
-    link_global: str = Form("true"),        # "true"/"false"
+    link_global: str = Form("true"),
     link_threshold: float = Form(0.93),
     samples_per_spk: int = Form(8),
     min_speakers: Optional[int] = Form(None),
@@ -311,52 +311,46 @@ async def run_diarization(
     pm = Depends(get_processing_manager),
 ):
     """
-    Endpoint ini sekarang support 2 mode gender:
-    - reference : pakai bank male_ref/female_ref (versi lama)
-    - hf_svm    : pakai model pretrained HF (griko/gender_cls_svm_ecapa_voxceleb)
-                  -> tidak butuh male_ref/female_ref
-                  -> pakai voting min_vote/min_len_sec
+    Jalankan diarization + gender tagging.
+    gender_mode:
+      - reference  : cosine sim ke bank male_ref/female_ref, voting per SPEAKER
+      - hf_svm     : ECAPA+SVM custom, gender per SEGMENT
+      - wav2vec2   : wav2vec2 age/gender, gender per SEGMENT
     """
 
     try:
-        # siapkan config lengkap buat ProcessingManager
         cfg = {
-            # --- mode klasifikasi gender:
-            "gender_mode": gender_mode,           # "reference" atau "hf_svm"
+            "gender_mode": gender_mode,
 
-            # untuk mode "reference" (lama)
-            "male_ref": male_ref or "",
-            "female_ref": female_ref or "",
+            # reference mode
+            "male_ref":      male_ref or "",
+            "female_ref":    female_ref or "",
 
-            # untuk mode "hf_svm" (baru)
-            "min_vote": float(min_vote),
-            "min_len_sec": float(min_len_sec),
+            # hf_svm / wav2vec2 mode
+            "min_vote":      float(min_vote),
+            "min_len_sec":   float(min_len_sec),
 
-            # umum untuk kedua mode
-            "top_n": int(top_n),
+            # umum
+            "top_n":         int(top_n),
+            "hf_token":      hf_token,
+            "use_gpu":       bool(use_gpu),
 
-            # diarization requirement
-            "hf_token": hf_token,
-            "use_gpu": bool(use_gpu),
-
-            # global linking config
-            "link_global": (link_global or "true").lower() == "true",
-            "link_threshold": float(link_threshold),
+            # linking (boleh diabaikan downstream kalau belum dipakai)
+            "link_global":     (link_global or "true").lower() == "true",
+            "link_threshold":  float(link_threshold),
             "samples_per_spk": int(samples_per_spk),
-            "min_speakers": min_speakers,
-            "max_speakers": max_speakers,
-            "min_sample_dur": float(min_sample_dur),
+            "min_speakers":    min_speakers,
+            "max_speakers":    max_speakers,
+            "min_sample_dur":  float(min_sample_dur),
         }
 
-        # jalankan pipeline diarization + gender + (opsional) global linking
-        # jalankan pipeline diarization + gender
         result = await pm.run_diarization(session_id, cfg)
 
-        # result sekarang berisi path 3 file timeline baru
+        # Processor akan lempar RuntimeError kalau gagal.
+        # Jadi kalau kita sampai sini harusnya success.
         return JSONResponse({
             "status": "diarization_completed",
             "speaker_timeline_raw":    result["speaker_timeline_raw"],
-            "speaker_timeline_linked": result["speaker_timeline_linked"],
             "gender_timeline":         result["gender_timeline"],
         })
 
@@ -366,6 +360,8 @@ async def run_diarization(
             status_code=400,
             detail=f"{e}\n{traceback.format_exc()}",
         )
+
+
 
 # Info & utilities used across tabs
 @router.get("/api/session/{session_id}")
@@ -1182,7 +1178,9 @@ def get_editing(
     assign_policy: str = Query("adaptive"),
     majority: float = Query(0.60),
     snap_ms: int = Query(120),
-
+    
+    preview_shift_ms: int = Query(0),  # <<--- BARU
+    
     # --- parameter warning (boleh dibiarkan default) ---
     min_ovl_spk: float = Query(0.25),   # ambang overlap SPEAKER minimal → WEAK kalau di bawah OK
     min_ovl_gen: float = Query(0.20),   # ambang overlap GENDER minimal → WEAK kalau di bawah OK
@@ -1396,92 +1394,74 @@ def get_editing(
         rows = [by_idx[k] for k in sorted(by_idx.keys())]
 
     # ------------------------------------------------------------------ #
-    # 5) HITUNG WARNING per baris (tanpa mengubah keputusan)
+    # 5) HITUNG WARNING per baris (SYNC CHECK PREVIEW)
+    #
+    # preview_shift_ms:
+    #   offset global (ms) yang user set di UI untuk "coba-coba".
+    #   Kita TIDAK mengubah row["start"] asli, cuma buat analisa warna.
+    #
+    # Rules warna:
+    #   abs_diff_ms > 1500 -> ALERT (merah)
+    #   abs_diff_ms >  500 -> WARN  (kuning)
+    #   else               -> OK    (hijau)
     # ------------------------------------------------------------------ #
-    def _hms_to_s(h: str) -> float:
-        hh, mm, rest = h.split(":")
-        ss, ms = rest.replace(".", ",").split(",")
-        return (int(hh)*3600 + int(mm)*60 + int(ss)) + (int(ms)/1000.0)
 
-    def _ovl(a0: float, a1: float, b0: float, b1: float) -> float:
-        x = min(a1, b1) - max(a0, b0)
-        return x if x > 0 else 0.0
-
-    # gabung semua boundary untuk metrik "mepet"
-    all_bounds = []
-    for ss in spk_segs or []:
-        all_bounds.append(float(ss["start_s"])); all_bounds.append(float(ss["end_s"]))
-    for gg in gen_segs or []:
-        all_bounds.append(float(gg["start_s"])); all_bounds.append(float(gg["end_s"]))
-
-    for r in rows:
-        # parse waktu SRT baris
+    def _ts_to_ms_local(ts_str: str) -> int:
         try:
-            a0 = _hms_to_s(r["start"]); a1 = _hms_to_s(r["end"])
+            hh = int(ts_str[0:2])
+            mm = int(ts_str[3:5])
+            ss = int(ts_str[6:8])
+            ms = int(ts_str[9:12])
+            total_ms = (((hh * 60 + mm) * 60) + ss) * 1000 + ms
+            return total_ms
         except Exception:
-            continue
-        dur = max(1e-6, a1 - a0)
+            return 0
 
-        # overlap SPEAKER berdasarkan speaker final di row
-        frac_spk = 0.0
-        if r.get("speaker") and spk_segs:
-            ov = 0.0
-            for ss in spk_segs:
-                if ss.get("speaker") == r["speaker"]:
-                    ov += _ovl(a0, a1, float(ss["start_s"]), float(ss["end_s"]))
-            frac_spk = ov / dur
+    base_tl = spk_segs if spk_segs else gen_segs
 
-        # overlap GENDER berdasarkan gender final di row
-        frac_gen = 0.0
-        if r.get("gender") and gen_segs:
-            ov = 0.0
-            for gg in gen_segs:
-                if gg.get("gender") == r["gender"]:
-                    ov += _ovl(a0, a1, float(gg["start_s"]), float(gg["end_s"]))
-            frac_gen = ov / dur
-
-        # dekat boundary? (mepet ≤ SNAP_MS)
-        near_start = min((abs(b - a0) for b in all_bounds), default=None)
-        near_end   = min((abs(b - a1) for b in all_bounds), default=None)
-
-        warn_codes = []
-
-        # Speaker quality
-        if frac_spk >= ok_frac:
+    voice_starts_sec = []
+    for seg in base_tl:
+        try:
+            voice_starts_sec.append(float(seg.get("start_s", 0.0)))
+        except Exception:
             pass
-        elif frac_spk >= min_ovl_spk:
-            warn_codes.append("SPK_WEAK")
+    voice_starts_sec.sort()
+
+    for row in rows:
+        # waktu subtitle asli -> ms
+        start_ts_str = row.get("start", "00:00:00,000")
+        start_sub_ms = _ts_to_ms_local(start_ts_str)
+
+        # terapkan preview shift global dari UI (coba-coba)
+        # NOTE: kalau nanti kamu merasa harus mundur, tinggal ganti + jadi -
+        start_sub_ms_preview = start_sub_ms + int(preview_shift_ms)
+        start_sub_s_preview  = start_sub_ms_preview / 1000.0
+
+        if voice_starts_sec:
+            nearest_voice_s = min(
+                voice_starts_sec,
+                key=lambda t: abs(t - start_sub_s_preview)
+            )
+            abs_diff_ms = int(
+                round(abs(nearest_voice_s - start_sub_s_preview) * 1000.0)
+            )
         else:
-            warn_codes.append("SPK_BAD")
+            abs_diff_ms = 999999
 
-        # Gender quality
-        if frac_gen >= ok_frac:
-            pass
-        elif frac_gen >= min_ovl_gen:
-            warn_codes.append("GEN_WEAK")
-        else:
-            warn_codes.append("GEN_BAD")
-
-        # Mepet boundary
-        if near_start is not None and near_start <= (SNAP_MS/1000.0): warn_codes.append("MEPET_START")
-        if near_end   is not None and near_end   <= (SNAP_MS/1000.0): warn_codes.append("MEPET_END")
-
-        # Mikro
-        if (dur*1000.0) <= very_short_ms: warn_codes.append("VERY_SHORT")
-
-        warn_level = "OK"
-        if any(c in warn_codes for c in ("SPK_BAD","GEN_BAD")):
+        if abs_diff_ms > 1500:
             warn_level = "ALERT"
-        elif warn_codes:
+        elif abs_diff_ms > 500:
             warn_level = "WARN"
+        else:
+            warn_level = "OK"
 
-        r["warn_level"]    = warn_level
-        r["warn_codes"]    = warn_codes
-        r["frac_spk"]      = round(float(frac_spk), 3)
-        r["frac_gen"]      = round(float(frac_gen), 3)
-        r["near_start_ms"] = int(round((near_start or 0.0)*1000))
-        r["near_end_ms"]   = int(round((near_end   or 0.0)*1000))
-        r["dur_ms"]        = int(round(dur*1000))
+        row["warn_level"]    = warn_level
+        row["warn_detail"]   = f"Δstart={abs_diff_ms}ms"
+        row["near_start_ms"] = abs_diff_ms
+        row["near_end_ms"]   = None
+        # dur_ms biarin
+
+
 
     # ------------------------------------------------------------------ #
     # 6) Final
@@ -4384,6 +4364,35 @@ async def export_build_stream(
 # Auto-Sync V5 – Helpers
 # =========================
 
+# =========================
+# Auto-Sync V5 – Helpers
+# =========================
+import math
+
+def _v5_snap_to_grid(ms: int, fps: float = 25.0, mode: str = "nearest", offset_ms: int = 0) -> int:
+    """
+    Jepit waktu ms ke grid frame fps.
+    - fps=25  -> 1 frame = 40.0 ms
+    - mode    : "nearest" | "ceil" | "floor"
+    - offset_ms: kalau butuh offset tetap (biasanya 0)
+    """
+    if ms < 0:
+        ms = 0
+    if fps <= 0:
+        return int(ms)
+
+    frame = 1000.0 / float(fps)  # contoh: 1000/25 = 40 ms per frame
+    x = ms - offset_ms
+
+    if mode == "ceil":
+        snapped = math.ceil(x / frame) * frame
+    elif mode == "floor":
+        snapped = math.floor(x / frame) * frame
+    else:  # "nearest"
+        snapped = round(x / frame) * frame
+
+    return max(0, int(snapped + offset_ms))
+
 def _v5_ts_to_ms(ts: str) -> int:
     # "HH:MM:SS,mmm" -> ms
     try:
@@ -4571,6 +4580,38 @@ def _v5_pick_speaker(spk_tl, st_s: float, en_s: float, near_sec: float):
         seg = _v5_nearest(spk_tl, (st_s+en_s)/2.0, max_radius=near_sec)
     return seg.get("speaker") if seg else ""
 
+def _v5_pick_gender_strict(gender_tl, st_s: float, en_s: float, old_gender: str):
+    """
+    Pakai gender dari segmen voice yang BENAR-BENAR overlap sama [st_s, en_s].
+    Kalau nggak ada overlap -> jangan ubah (balikkan old_gender).
+    Tidak ada fallback nearest, tidak ada voting mayoritas.
+    """
+    best_seg, ol = _v5_best_overlap(gender_tl, st_s, en_s)
+    if not best_seg or ol <= 0.0:
+        return old_gender  # tidak ada overlap => pertahankan label lama
+
+    g = (best_seg.get("gender") or "unknown").lower()
+    if g not in ("male", "female", "unknown"):
+        g = "unknown"
+    return g
+
+
+def _v5_pick_speaker_strict(spk_tl, st_s: float, en_s: float, old_speaker: str):
+    """
+    Pakai speaker dari segmen voice yang BENAR-BENAR overlap.
+    Kalau nggak ada overlap -> jangan ubah (balikkan old_speaker).
+    Tidak ada nearest, tidak ada merge mayoritas.
+    """
+    if not spk_tl:
+        return old_speaker
+
+    best_seg, ol = _v5_best_overlap(spk_tl, st_s, en_s)
+    if not best_seg or ol <= 0.0:
+        return old_speaker
+
+    sp = best_seg.get("speaker") or ""
+    return sp if sp else old_speaker
+
 @router.post("/api/session/{session_id}/editing/auto-sync-v5")
 def editing_auto_sync_v5(
     session_id: str,
@@ -4579,22 +4620,38 @@ def editing_auto_sync_v5(
 ):
     """
     V5 Auto-Sync:
-      - Geser START subtitle agar selaras voice (END dikunci).
-      - Setelah geser: re-label GENDER dari gender_timeline, SPEAKER dari speaker_timeline.
-      - Tulis kembali ke editing_cache.json (dokumen kerja).
+    - Geser START subtitle agar selaras voice.
+      END DIKUNCI (tidak digeser).
+    - START HANYA BOLEH TETAP atau LEBIH AWAL dari baseline aslinya.
+      Tidak boleh jadi LEBIH TELAT (biar durasi tidak makin pendek kalau auto-sync di-run berkali-kali).
+    - Setelah geser, ambil gender/speaker dari timeline mentah
+      HANYA jika benar-benar overlap.
+    - Simpan balik ke editing_cache.json (dokumen kerja).
+    - TIDAK menyentuh translated_latest.srt (OCR asli aman).
     """
-    ws = _ws(pm, session_id)  # gunakan helpermu yang sudah ada
+
+    ws = _ws(pm, session_id)
     if not ws or not Path(ws).exists():
         raise HTTPException(404, "Workspace tidak ditemukan")
 
-    # Parametriasi
-    snap_ms        = int((body or {}).get("snap_ms", 400))      # snap ke boundary voice bila beda <= ini
-    radius_ms      = int((body or {}).get("radius_ms", 600))    # jendela cari voice di sekitar start mapped
-    radius_near_ms = int((body or {}).get("radius_near_ms", 2000)) # fallback nearest radius
-    min_gap_ms     = int((body or {}).get("min_gap_ms", 30))    # gap minimal antar baris
-    min_dur_ms     = int((body or {}).get("min_dur_ms", 80))    # durasi minimal hasil
+    # =========================
+    # Parameter halus
+    # =========================
+    snap_ms        = int((body or {}).get("snap_ms",        2500))
+    radius_ms      = int((body or {}).get("radius_ms",      2500))
+    radius_near_ms = int((body or {}).get("radius_near_ms", 2500))  # dipakai di _v5_build_voice_anchors lewat _v5_nearest
+    min_gap_ms     = int((body or {}).get("min_gap_ms",     30))
+    min_dur_ms     = int((body or {}).get("min_dur_ms",     80))
 
-    # 1) muat editing_cache.json (rows kerja)
+    # Grid / frame sync (CapCut / export)
+    fps            = float((body or {}).get("fps", 25.0))
+    snap_to_grid   = bool((body or {}).get("snap_to_grid", True))
+    snap_mode      = (body or {}).get("snap_mode", "nearest")
+    snap_offset_ms = int((body or {}).get("snap_offset_ms", 0))
+
+    # =========================
+    # 1) load editing_cache.json
+    # =========================
     ec = Path(ws) / "editing_cache.json"
     obj = _v5_load_json(ec)
     if not isinstance(obj, dict) or not isinstance(obj.get("rows"), list):
@@ -4606,9 +4663,10 @@ def editing_auto_sync_v5(
         try:
             s_ms = _v5_ts_to_ms(r["start"])
             e_ms = _v5_ts_to_ms(r["end"])
-            if e_ms <= s_ms: e_ms = s_ms + 1
+            if e_ms <= s_ms:
+                e_ms = s_ms + 1
             rows.append({
-                "ref": r,  # pointer ke dict asli untuk update
+                "ref": r,  # pointer langsung ke dict baris di editing_cache.json
                 "index": int(r.get("index", 0)),
                 "start_ms": s_ms,
                 "end_ms": e_ms,
@@ -4621,103 +4679,232 @@ def editing_auto_sync_v5(
     if not rows:
         raise HTTPException(400, "Tidak ada baris di editing_cache.json")
 
-    # 2) muat timeline terpisah
+    # =========================
+    # 2) load timeline mentah (ground truth dari audio)
+    # =========================
     gender_tl = _v5_load_gender_timeline(Path(ws))
     spk_tl    = _v5_load_speaker_timeline(Path(ws))
+
     if not gender_tl:
         raise HTTPException(404, "gender_timeline.json tidak ditemukan")
     if not spk_tl:
-        # masih lanjut, tapi speaker bisa kosong
+        # boleh kosong. berarti kita gak bisa update speaker apa-apa
         spk_tl = []
 
-    # 3) bangun anchors & fit global (map subtitle_start -> voice_start)
-    anchors = _v5_build_voice_anchors(rows, spk_tl if spk_tl else gender_tl, use_start=True)
-    a, b = _v5_fit_axb(anchors)  # detik
+    # =========================
+    # 3) build anchors utk hitung peta waktu subtitle -> waktu voice
+    #    pakai speaker timeline kalau ada (lebih stabil); fallback gender timeline
+    # =========================
+    anchors_source = spk_tl if spk_tl else gender_tl
+    anchors = _v5_build_voice_anchors(rows, anchors_source, use_start=True)
+    a, b = _v5_fit_axb(anchors)  # detik. y ≈ a*x + b
 
-    # 4) apply mapping + snap only-start + constraints + re-label
+    # =========================
+    # 4) apply mapping ke setiap row
+    # =========================
     changed = 0
     gender_changed = 0
     speaker_changed = 0
 
     prev_end_ms = None
-    for i, r in enumerate(rows):
-        s0 = r["start_ms"] / 1000.0
-        e0 = r["end_ms"]   / 1000.0
 
-        # 4a) map secara global
-        s_map = a*s0 + b
+    for i, rowinfo in enumerate(rows):
+        ref = rowinfo["ref"]
 
-        # 4b) snap ke boundary voice (menggunakan speaker TL jika ada; kalau tidak gender TL)
-        voice = spk_tl if spk_tl else gender_tl
+        # -------------------------
+        # 4.0) BASELINE START LOCK
+        # -------------------------
+        # baseline_start_ms = batas KANAN maksimum start baris ini.
+        # Baris TIDAK BOLEH dimajukan ke KANAN melewati baseline ini.
+        #
+        # - Kalau ini pertama kali auto-sync jalan, baris belum punya "orig_start_ms".
+        #   Kita set orig_start_ms = start_ms saat ini.
+        # - Setelah itu orig_start_ms disimpan, jadi next auto-sync pakai angka lama yg sama.
+        if "orig_start_ms" not in ref:
+            ref["orig_start_ms"] = rowinfo["start_ms"]
+        baseline_start_ms = int(ref["orig_start_ms"])
+
+        # simpan gender/speaker lama (fallback bila tidak overlap)
+        old_g  = (ref.get("gender") or "unknown").lower()
+        old_sp = ref.get("speaker") or ""
+
+        # waktu awal & akhir baris SEBELUM sync (detik)
+        s0 = rowinfo["start_ms"] / 1000.0
+        e0 = rowinfo["end_ms"]   / 1000.0
+
+        # -------------------------
+        # 4a) mapping global pakai regresi linier a*x + b
+        # -------------------------
+        s_map = a * s0 + b  # detik (prediksi posisi start menurut audio)
+
+        # -------------------------
+        # 4b) snap start ke boundary voice terdekat (kalau cukup dekat)
+        # cari kandidat di sekitar s_map (radius_ms)
+        # lalu kalau jaraknya <= snap_ms, pakai anchor itu
+        # kalau tidak, pakai s_map
+        # -------------------------
         snap_target = None
         best_d = 1e9
-        for seg in voice:
-            # kandidat dekat saja
-            if seg["start"] < (s_map - radius_ms/1000.0):
+        low_s  = s_map - (radius_ms / 1000.0)
+        high_s = s_map + (radius_ms / 1000.0)
+
+        for seg in anchors_source:
+            st = seg["start"]
+            if st < low_s:
                 continue
-            if seg["start"] > (s_map + radius_ms/1000.0):
+            if st > high_s:
                 break
-            d = abs(seg["start"] - s_map)
+            d = abs(st - s_map)
             if d < best_d:
                 best_d = d
-                snap_target = seg["start"]
-        if snap_target is not None and best_d*1000.0 <= snap_ms:
+                snap_target = st
+
+        if snap_target is not None and (best_d * 1000.0) <= snap_ms:
             s_new = snap_target
         else:
             s_new = s_map
 
-        # 4c) konversi & constraints (end tetap)
-        s_ms = int(round(s_new*1000.0))
-        e_ms = r["end_ms"]
+        # -------------------------
+        # 4c) terjemahkan ke ms
+        # END DIKUNCI (kita tidak geser end)
+        # -------------------------
+        s_ms = int(round(s_new * 1000.0))
+        e_ms = rowinfo["end_ms"]
 
-        # jaga durasi
+        # --- Safety awal: jaga minimal durasi
         if e_ms < s_ms + min_dur_ms:
             s_ms = max(0, e_ms - min_dur_ms)
 
-        # jaga gap dengan baris sebelumnya
+        # --- Safety antar baris:
+        # jangan nabrak baris sebelumnya. kalau nabrak,
+        # kita geser start ke (prev_end_ms + min_gap_ms).
+        # Catatan: ini POTENSI bikin s_ms jadi LEBIH TELAT.
+        # nanti setelah snap/grid kita akan KUNCI supaya
+        # tidak boleh lebih telat dari baseline_start_ms.
         if prev_end_ms is not None and s_ms < (prev_end_ms + min_gap_ms):
             s_ms = prev_end_ms + min_gap_ms
+            # kalau sekarang durasi jadi 0, boleh paksa tambah e_ms dikit
             if e_ms < s_ms + min_dur_ms:
-                e_ms = s_ms + min_dur_ms  # sebagai last resort (harusnya jarang)
+                e_ms = s_ms + min_dur_ms
 
-        # 4d) re-label gender & speaker berdasarkan interval baru
+        # -------------------------
+        # 4d) SNAP KE GRID FPS (frame-align ke timeline export / CapCut)
+        # -------------------------
+        if snap_to_grid:
+            # Snap start ke grid frame (fps, offset, mode)
+            s_ms = _v5_snap_to_grid(
+                s_ms,
+                fps=fps,
+                mode=snap_mode,        # "nearest" biasanya
+                offset_ms=snap_offset_ms
+            )
+
+            # Safety ulang setelah snap:
+            # - jangan overlap parah dengan baris sebelumnya
+            if prev_end_ms is not None and s_ms < (prev_end_ms + min_gap_ms):
+                s_ms = _v5_snap_to_grid(
+                    prev_end_ms + min_gap_ms,
+                    fps=fps,
+                    mode="ceil",
+                    offset_ms=snap_offset_ms
+                )
+
+            # - jangan sampai durasi < min_dur_ms
+            if e_ms < s_ms + min_dur_ms:
+                # geser start mundur tapi tetap snap ke grid
+                s_ms = _v5_snap_to_grid(
+                    e_ms - min_dur_ms,
+                    fps=fps,
+                    mode="floor",
+                    offset_ms=snap_offset_ms
+                )
+                if s_ms < 0:
+                    s_ms = 0
+
+        # -------------------------
+        # 4e) KUNCI ARAH GESER START
+        # HANYA BOLEH TETAP atau LEBIH AWAL dari baseline_start_ms.
+        # TIDAK BOLEH JADI LEBIH TELAT.
+        #
+        # Contoh kasus jelek (TIDAK BOLEH):
+        #   baseline_start_ms = 1920
+        #   hasil sementara   = 2720
+        #   end               = 3320
+        #   => durasi terlalu pendek
+        #
+        # Jadi kalau s_ms > baseline_start_ms, kita balikin.
+        # Lalu pastikan lagi durasi minimal aman.
+        # -------------------------
+        if s_ms > baseline_start_ms:
+            s_ms = baseline_start_ms
+            if e_ms < s_ms + min_dur_ms:
+                s_ms = max(0, e_ms - min_dur_ms)
+                
+        allowed_shift_ms = radius_ms  # <= ini sudah kita parse dari body di atas
+        min_allowed_ms   = baseline_start_ms - allowed_shift_ms
+
+        if s_ms < min_allowed_ms:
+            s_ms = min_allowed_ms
+            if s_ms < 0:
+                s_ms = 0
+            # jaga durasi minimum setelah kita tarik mundur s_ms
+            if e_ms < s_ms + min_dur_ms:
+                s_ms = max(0, e_ms - min_dur_ms)
+        # NOTE: di sini kita SENGAJA TIDAK maksa lagi "min_gap_ms"
+        # setelah clamp, karena tujuan utama kita:
+        # jangan sampai baris jadi super pendek akibat digeser makin telat.
+        # Lebih baik ada sedikit overlap antar subtitle daripada durasi 0.3 detik.
+
+        # -------------------------
+        # 4f) setelah final s_ms/e_ms -> ambil gender/speaker strict overlap
+        # -------------------------
         st_s = s_ms / 1000.0
         en_s = e_ms / 1000.0
 
-        new_gender = _v5_pick_gender(gender_tl, st_s, en_s, near_sec=radius_near_ms/1000.0)
-        new_speaker = _v5_pick_speaker(spk_tl, st_s, en_s, near_sec=radius_near_ms/1000.0) if spk_tl else (r["speaker"] or "")
+        new_gender  = _v5_pick_gender_strict(gender_tl, st_s, en_s, old_g)
+        new_speaker = _v5_pick_speaker_strict(spk_tl,    st_s, en_s, old_sp)
 
-        # 4e) tulis balik ke dict original (editing_cache.json)
-        ref = r["ref"]
-        if ref.get("start") != _v5_ms_to_ts(s_ms):
-            ref["start"] = _v5_ms_to_ts(s_ms)
+        # -------------------------
+        # 4g) tulis balik perubahan ke row asli (editing_cache.json)
+        # -------------------------
+
+        # waktu "start" string baru ("00:00:01,920" format SRT)
+        new_start_ts = _v5_ms_to_ts(s_ms)
+        if ref.get("start") != new_start_ts:
+            ref["start"] = new_start_ts
             changed += 1
 
-        # end dikunci – tetap!
-        # Jika kamu juga menyimpan eff_* untuk audio slice, boleh ikut update:
+        # END TETAP. kita tidak geser "end".
+        # tapi kalau kamu punya field eff_start_ms / eff_end_ms, kita update di sini:
         if "eff_start_ms" in ref:
             ref["eff_start_ms"] = s_ms
         if "eff_end_ms" in ref:
             ref["eff_end_ms"] = e_ms
 
-        # perbarui gender
-        old_g = (ref.get("gender") or "unknown").lower()
+        # simpan baseline_start_ms supaya next auto-sync tetap pakai batas kanan yg sama
+        ref["orig_start_ms"] = baseline_start_ms
+
+        # update gender hanya kalau overlap STRONG kasih info beda
         if new_gender and new_gender != old_g:
             ref["gender"] = new_gender
             gender_changed += 1
 
-        # perbarui speaker
-        old_sp = ref.get("speaker") or ""
+        # update speaker hanya kalau overlap STRONG kasih info beda
         if new_speaker and new_speaker != old_sp:
             ref["speaker"] = new_speaker
             speaker_changed += 1
 
+        # simpan end baris ini buat patokan baris berikutnya
         prev_end_ms = e_ms
 
-    # 5) simpan cache kerja
+    # =========================
+    # 5) simpan editing_cache.json yang sudah diperbarui
+    # =========================
     ec.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 6) tulis meta debug
+    # =========================
+    # 6) simpan metadata debug
+    # =========================
     meta = {
         "anchors": len(anchors),
         "fit": {"a": a, "b_ms": int(round(b*1000.0))},
@@ -4729,7 +4916,9 @@ def editing_auto_sync_v5(
             "speaker_timeline": bool(spk_tl),
         }
     }
-    (Path(ws)/"editing_auto_sync_v5.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (Path(ws) / "editing_auto_sync_v5.json").write_text(
+        json.dumps(meta, indent=2),
+        encoding="utf-8"
+    )
 
     return JSONResponse({"ok": True, **meta})
-

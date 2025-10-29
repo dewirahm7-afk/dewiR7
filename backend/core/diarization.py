@@ -1,48 +1,68 @@
 # backend/core/diarization.py
+#
+# Tugas:
+# - Build argumen untuk dracin_gender.py
+# - Jalankan dracin_gender.main() di thread terpisah
+# - Pindahkan output timeline ke root workdir
+# - Kembalikan path hasil ke caller (processor, endpoint)
+#
+# Sekarang support 3 mode gender:
+#   reference  -> butuh male_ref/female_ref, voting per SPEAKER
+#   hf_svm     -> ECAPA+SVM custom, per SEGMENT
+#   wav2vec2   -> audEERING wav2vec2 age+gender, per SEGMENT
+#
+# Catatan:
+# - Semua model dijalankan offline (kecuali diarization pyannote yang tetap butuh HF token).
+# - global linking (merge speaker lokal jadi SPK_01, SPK_02) bisa ditambahkan di processor.py
+#   setelah kami return data ini.
+#
+# ---------------------------------------------------------------------
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 import sys
-import traceback
 import shutil
 import json
+import traceback
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PYTHONPATH bootstrap: pastikan modul di repo root (selevel "backend/") bisa di-import
-# ──────────────────────────────────────────────────────────────────────────────
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
 class DiarizationEngine:
-    """Menjalankan diarization persis alur GUI lama:
-       - Male/Female Reference boleh folder (dikompilasi jadi bank .wav) atau file langsung
-       - Semua output (segments/speakers/SRT) dipastikan berada di root workdir session
-       - Selalu mengembalikan dict: {success: bool, data|error}
+    """
+    Jalankan diarization + gender tagging via dracin_gender.py.
+    Selalu return dict:
+      sukses:
+        {
+          "success": True,
+          "data": {
+            "speaker_timeline_raw": "<abs path>",
+            "gender_timeline": "<abs path>"
+          }
+        }
+      gagal:
+        { "success": False, "error": "<pesan>" }
     """
 
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=1)
 
     async def process(self, session, config: dict, progress_callback=None) -> dict:
-        """SELALU return dict:
-           - sukses: {"success": True,  "data": {"segjson": "<path>", "spkjson": "<path>", "srt": "<path>|None"}}
-           - gagal : {"success": False, "error": "<pesan>"}
-        """
         workdir = Path(session.workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
         def task():
             try:
-                # import ditunda agar PYTHONPATH di atas sudah aktif
+                # import lokal supaya path ROOT sudah ditambah
                 from dracin_gender import main as gender_main
                 import torch
                 import torchaudio
 
-                # ── helper ───────────────────────────────────────────────────────
+                # ------------ helper util lokal ------------
                 AUDIO_PATS = ("*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg")
 
                 def list_audio(p: Path):
@@ -57,9 +77,7 @@ class DiarizationEngine:
                 def make_bank(ref_input: str, label: str) -> str:
                     """
                     Bangun <label>_bank.wav (16k mono) di workdir dari folder/file.
-                    - kalau ref_input adalah folder, gabung semua file audio jadi satu bank.
-                    - kalau ref_input adalah 1 file, jadikan dia bank tunggal.
-                    Return: path string ke bank .wav final di workdir.
+                    Ini dipakai gender_mode="reference".
                     """
                     src = Path(os.path.expandvars(ref_input)).expanduser()
                     files = list_audio(src)
@@ -70,7 +88,7 @@ class DiarizationEngine:
                     meta_samples = []
                     for f in files:
                         wav, sr = torchaudio.load(str(f))
-                        # channel merge -> mono
+                        # stereo -> mono
                         if wav.dim() == 2 and wav.size(0) > 1:
                             wav = wav.mean(dim=0, keepdim=True)
                         wav = wav.squeeze(0)
@@ -78,12 +96,10 @@ class DiarizationEngine:
                         if sr != 16000:
                             wav = torchaudio.transforms.Resample(sr, 16000)(wav)
                         chunks.append(wav)
-                        meta_samples.append(
-                            {
-                                "src": str(f),
-                                "dur_sec": float(wav.numel()) / 16000.0,
-                            }
-                        )
+                        meta_samples.append({
+                            "src": str(f),
+                            "dur_sec": float(wav.numel()) / 16000.0,
+                        })
 
                     full = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
                     out_wav = workdir / f"{label}_bank.wav"
@@ -111,84 +127,80 @@ class DiarizationEngine:
 
                 def bring_to_root(p: Path) -> Path:
                     """
-                    pastikan semua *_segments.json, *_speakers.json, *.srt
-                    akhirnya pindah ke root workdir (bukan subfolder)
+                    Pastikan file penting akhirnya ada di root workdir
+                    (bukan di subfolder random).
                     """
                     if p and p.parent != workdir:
                         dst = workdir / p.name
                         try:
                             shutil.move(str(p), str(dst))
                         except Exception:
-                            # kalau gagal move (misal sama drive?), ya sudah biarkan di tempat
                             dst = p
                         return dst
                     return p
 
-                # ───────────────────────────────────────────
-                # Ambil parameter dari config
-                # ───────────────────────────────────────────
-                gender_mode = config.get("gender_mode", "reference")  # "reference" / "hf_svm"
-                top_n       = int(config.get("top_n", 5))
-                hf_token    = (config.get("hf_token") or "").strip()
-                use_gpu     = bool(config.get("use_gpu", True))
+                # ------------ ambil config dari frontend ------------
+                gender_mode   = config.get("gender_mode", "hf_svm")  # "reference" / "hf_svm" / "wav2vec2"
+                top_n         = int(config.get("top_n", 5))
 
-                # hanya dipakai mode hf_svm:
-                min_vote    = float(config.get("min_vote", 0.7))
-                min_len_sec = float(config.get("min_len_sec", 0.3))
+                hf_token      = (config.get("hf_token") or "").strip()
+                use_gpu       = bool(config.get("use_gpu", True))
 
-                # hanya dipakai mode reference:
+                # hanya dipakai hf_svm / wav2vec2:
+                min_vote      = float(config.get("min_vote", 0.7))
+                min_len_sec   = float(config.get("min_len_sec", 0.3))
+
+                # hanya dipakai reference:
                 male_ref_in   = config.get("male_ref", "")
                 female_ref_in = config.get("female_ref", "")
 
-                # nama file audio vokal 16k (sudah diextract step sebelumnya)
+                # session.wav_16k harus sudah diisi waktu Extract Audio
                 audio_arg = Path(session.wav_16k).name
 
-                # siapkan argv untuk panggil dracin_gender.main()
+                # ------------ siapkan sys.argv buat dracin_gender.main() ------------
                 argv_backup = sys.argv[:]
                 sys.argv = [
                     "dracin_gender",
                     "--audio", audio_arg,
                     "--gender_mode", gender_mode,
-                    "--outdir", ".",         # sangat penting: output ke workdir
+                    "--outdir", ".",           # output langsung ke workdir
                     "--top_n", str(top_n),
                 ]
 
                 if gender_mode == "reference":
-                    # kita butuh bank male/female
-                    male_ref_wav = make_bank(male_ref_in,   "male")
+                    male_ref_wav   = make_bank(male_ref_in,   "male")
                     female_ref_wav = make_bank(female_ref_in, "female")
 
-                    male_ref_arg   = Path(male_ref_wav).name
-                    female_ref_arg = Path(female_ref_wav).name
-
                     sys.argv += [
-                        "--male_ref", male_ref_arg,
-                        "--female_ref", female_ref_arg,
+                        "--male_ref",   Path(male_ref_wav).name,
+                        "--female_ref", Path(female_ref_wav).name,
+                        # mode reference TIDAK pakai --min_vote/min_len_sec
                     ]
-                    # tidak kirim --min_vote / --min_len_sec di mode lama
 
-                else:
-                    # gender_mode == "hf_svm"
-                    # tidak ada bank referensi
+                elif gender_mode in ("hf_svm", "wav2vec2"):
+                    # dua mode ini butuh threshold per-segmen
                     sys.argv += [
-                        "--min_vote", str(min_vote),
+                        "--min_vote",    str(min_vote),
                         "--min_len_sec", str(min_len_sec),
                     ]
 
-                # optional flags umum
+                else:
+                    # kalau user kirim mode aneh
+                    raise ValueError(f"Unsupported gender_mode: {gender_mode}")
+
                 if hf_token:
                     sys.argv += ["--hf_token", hf_token]
                 if use_gpu:
                     sys.argv += ["--use_gpu"]
 
-                # ── jalankan dracin_gender.py di CWD = workdir ──────────────────
+                # ------------ jalankan dracin_gender di workdir ------------
                 old_cwd = os.getcwd()
                 os.chdir(workdir)
                 try:
                     try:
-                        gender_main()  # argparse di dracin_gender akan baca sys.argv yg barusan kita isi
+                        gender_main()
                     except SystemExit as e:
-                        # argparse bisa SystemExit(code=2) kalau argumen salah
+                        # argparse di dracin_gender bisa raise SystemExit(code=2) kalau argumen salah
                         return {
                             "success": False,
                             "error": f"dracin_gender exited with code {getattr(e, 'code', None)}",
@@ -197,7 +209,7 @@ class DiarizationEngine:
                     os.chdir(old_cwd)
                     sys.argv = argv_backup
 
-                # ── cari output timeline baru dari dracin_gender ----------------
+                # ------------ ambil output yg baru dibuat ------------
                 spk_raw = latest("*_speaker_timeline_raw.json")
                 gen_tl  = latest("*_gender_timeline.json")
 
@@ -212,11 +224,10 @@ class DiarizationEngine:
 
                 data = {
                     "speaker_timeline_raw": str(spk_raw),
-                    "gender_timeline": str(gen_tl),
+                    "gender_timeline":      str(gen_tl),
                 }
 
                 return {"success": True, "data": data}
-
 
             except BaseException as e:
                 return {
@@ -224,14 +235,14 @@ class DiarizationEngine:
                     "error": f"{e}\n{traceback.format_exc()}",
                 }
 
+        # jalankan blocking task() di thread pool
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(self.executor, task)
 
-        # guard: jangan pernah return None
         if not isinstance(result, dict):
             return {
                 "success": False,
                 "error": f"Engine returned invalid result: {result!r}",
             }
-        return result
 
+        return result
