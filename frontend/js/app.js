@@ -332,7 +332,7 @@ class DracinApp {
 					<!-- HF Token -->
 					<div class="md:col-span-2">
 						<label class="block text-sm font-medium mb-2 text-gray-300">HF Token</label>
-						<input id="hf-token" type="password" value="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"
+						<input id="hf-token" type="password" value="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"
 							   class="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:border-blue-500 text-white placeholder-gray-400">
 					</div>
 
